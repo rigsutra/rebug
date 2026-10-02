@@ -52,6 +52,53 @@ apitest discover https://orders-staging.example.com
 - **Runs** tab: history. **Settings** tab: everything from the new-project form.
 - **Export CLI config** gives the YAML for CI. Selecting APIs works there too: `apitest run --config x.yaml --op "GET /orders/{id}"`.
 
+**Live activity.** While a run is going, the run page shows **Now**: the current test, the API it's on,
+what it's doing ("Sending invalid credentials; expecting 401/403", "Field 3/7 `price`: sending wrong
+types", "Active scan: attacking the APIs 40%") and an "N / M APIs done" bar. Below it is a live feed
+of results, with failures in red. After the run, the feed is kept as a collapsed **Activity log**.
+
+**HTML report** (run page → **Open HTML report**, also inside the ZIP as `test-report.html`). One
+self-contained file you can open offline or send to someone:
+
+- **Read this first**: run-level problems, e.g. no token set (so protected APIs only returned 401),
+  test data written to the database, no second user for cross-user checks, a test that didn't run.
+- **All APIs**: one row per API, one symbol per test: ✓ tested · ◐ partly tested · ✕ not tested ·
+  – not applicable · ? not recorded. Hover a symbol for the reason.
+- **Per API**: what was tested and what wasn't, and why (e.g. "None of the 193 requests was accepted
+  (142 refused with 401/403…) because no token was set"; "This API takes an ID, but no cross-user
+  scenario is configured for it"). Then the problems found, and every test sent to it: what was
+  tested, what was expected, the result in plain words, and the full input and output.
+
+The same per-API coverage is in `coverage.csv` / `coverage.json`, and each test-log entry has a
+plain-language `explanation`.
+
+**No token, no silent run.** If APIs in the run need login and no token is set for user A, the UI
+asks before starting (Open Settings / Run anyway). Tokens typed into Settings are forgotten when the
+apitest server restarts; use `${ENV_VAR}` references to keep them.
+
+**Test log.** Every test apitest performs is recorded: one entry per request, with the stage, the
+API, the scenario tested ("Boundary values and wrong types: Missing `Authorization` at header",
+"Field `price` (declared number) set to numeric string \"1.5\"", "BOLA step 2: user B requests user
+A's resource"), what a correct API should do, the verdict (pass / fail / info / error), the full
+request and response, and the reason for any failure. The run page's **Test log** tab lets you filter
+by stage, API, verdict and text, and expand any entry. Downloads:
+
+- **Everything (ZIP)**: test log, findings report, the spec tested, and every tool's raw output
+- **Test log (CSV)**: one row per test, opens in Excel
+- **Test log (NDJSON)**: one JSON object per test, with full requests and responses
+
+Token values and API keys are masked (`Bearer ***`) in every file. The CLI writes the same
+`test-log.ndjson` and `test-log.csv` to its output folder.
+
+What each stage logs: **conformance** logs every request Schemathesis sends, with its phase, the
+generated scenario and every check result. **types** logs the baseline and each wrong-type request.
+**authz** logs each credentials test, public-endpoint check and both BOLA steps. **zap** logs every
+alert instance (URL, parameter, attack, evidence); ZAP doesn't export the requests that raised no
+alert, which are only summarised. **lint** logs each rule violation.
+
+**Exclude paths** (Settings → Advanced) apply to every test, ZAP included. Excluded APIs are greyed
+out in the API list, and the **Run all** count only includes APIs that will actually be tested.
+
 **Stop.** A running test can be stopped from the run page, the project page or the project card.
 The current tool is killed (including its child processes, and the ZAP container) and partial
 results from the stages that finished are kept.

@@ -89,7 +89,7 @@ function route() {
   if (h === "/") return pageProjects();
   if (h === "/new") return pageProjectForm(null);
   if ((m = h.match(/^\/p\/([\w-]+)(?:\/(\w+))?$/))) return pageProject(m[1], m[2] || "apis");
-  if ((m = h.match(/^\/r\/([\w-]+)$/))) return pageRun(m[1]);
+  if ((m = h.match(/^\/r\/([\w-]+)(?:\?(.*))?$/))) return pageRun(m[1], Object.fromEntries(new URLSearchParams(m[2] || "")));
   location.hash = "#/";
 }
 
@@ -114,8 +114,7 @@ async function pageProjects() {
       <button class="primary" onclick="location.hash='#/new'">+ New project</button></div>
     <div class="cards">${projects.map(projectCard).join("")}</div>`;
   $$("[data-run-all]").forEach((b) => b.addEventListener("click", async () => {
-    try { const { id } = await post(`/api/projects/${b.dataset.runAll}/runs`, { operations: [] }); location.hash = `#/r/${id}`; }
-    catch (e) { toast(e.message, true); }
+    startProjectRun(b.dataset.runAll, []);
   }));
   $$("[data-stop]").forEach((b) => b.addEventListener("click", () => stopRun(b.dataset.stop).then(pageProjects)));
   if (projects.some((p) => p.running)) timer = setTimeout(() => tok === pageToken && pageProjects(), 3000);
@@ -133,7 +132,7 @@ function projectCard(p) {
   return `<div class="card">
     <h3><a href="#/p/${esc(p.id)}">${esc(p.name)}</a></h3>
     ${p.description ? `<div class="desc">${esc(p.description)}</div>` : ""}
-    <div class="meta">${esc(si.title || "")} ${esc(si.api_version || "")} · <b>${p.operations}</b> APIs</div>
+    <div class="meta">${esc(si.title || "")} ${esc(si.api_version || "")} · <b>${p.operations - (p.excluded || 0)}</b> APIs tested${p.excluded ? ` · ${p.excluded} excluded` : ""}</div>
     <div class="spec">${esc(p.spec)}</div>
     <div class="last">${lastHtml}</div>
     <div class="toolbar">
@@ -141,6 +140,26 @@ function projectCard(p) {
                   : `<button class="primary small" data-run-all="${esc(p.id)}">▶ Run all APIs</button>`}
       <button class="secondary small" onclick="location.hash='#/p/${esc(p.id)}'">Open</button>
     </div></div>`;
+}
+
+/** Start a run; if the server says no token is set for APIs that need login, ask first. */
+async function startProjectRun(pid, operations, force = false) {
+  try {
+    const { id } = await post(`/api/projects/${pid}/runs`, { operations, force });
+    location.hash = `#/r/${id}`;
+  } catch (e) {
+    let info = null;
+    try { info = JSON.parse(e.message); } catch { /* plain error */ }
+    if (info?.code !== "NO_TOKEN") return toast(e.message, true);
+    const choice = await dialog("No token set", `<p>${esc(info.message)}</p>
+      <p>Add user A's token under <b>Settings → Test users</b>, then run again.</p>`, [
+      { label: "Open Settings", cls: "primary", value: "settings" },
+      { label: "Run anyway", value: "force" },
+      { label: "Cancel", value: null },
+    ]);
+    if (choice === "settings") location.hash = `#/p/${pid}/settings`;
+    else if (choice === "force") startProjectRun(pid, operations, true);
+  }
 }
 
 async function stopRun(runId) {
@@ -391,14 +410,17 @@ async function pageProject(pid, tab) {
   if (tok !== pageToken) return;
   crumbs([["Projects", "#/"], [p.name]]);
   const si = p.spec_info || {};
-  const selected = new Set(JSON.parse(sessionStorage.getItem(`sel.${pid}`) || "[]").filter((l) => p.operations.some((o) => o.label === l)));
+  const testable = p.operations.filter((o) => !o.excluded);
+  const nExcluded = p.operations.length - testable.length;
+  const selected = new Set(JSON.parse(sessionStorage.getItem(`sel.${pid}`) || "[]").filter((l) => testable.some((o) => o.label === l)));
   const saveSel = () => sessionStorage.setItem(`sel.${pid}`, JSON.stringify([...selected]));
 
   view.innerHTML = `
     <div class="page-head">
       <div><h1>${esc(p.name)}</h1>
         <div class="meta">${p.description ? esc(p.description) + " · " : ""}${esc(si.title || "")} ${esc(si.api_version || "")} ·
-          ${si.version === "swagger2" ? "Swagger 2.0" : "OpenAPI 3"} · <b>${p.operations.length}</b> APIs</div>
+          ${si.version === "swagger2" ? "Swagger 2.0" : "OpenAPI 3"} · <b>${p.operations.length}</b> APIs${nExcluded
+            ? ` · <b>${nExcluded}</b> excluded in <a href="#/p/${esc(pid)}/settings">Settings</a>` : ""}</div>
         <div class="meta">Spec <code>${esc(p.spec)}</code> → <code>${esc(p.base_url || si.base_url || "no base URL")}</code>
           · API list refreshed ${esc(fmtAgo(p.refreshed))}</div></div>
       <div class="toolbar">
@@ -416,15 +438,15 @@ async function pageProject(pid, tab) {
 
   const runbar = $("[data-out=runbar]", view);
   const startRun = async (operations) => {
-    try { const { id } = await post(`/api/projects/${pid}/runs`, { operations }); location.hash = `#/r/${id}`; }
-    catch (e) { toast(e.message, true); }
+    await startProjectRun(pid, operations);
   };
   const renderRunbar = () => {
     const stages = (p.stages || []).join(", ");
     runbar.innerHTML = p.running
       ? `<span class="live">Test running</span> <a href="#/r/${esc(p.running)}">Watch progress</a><span class="grow"></span>
          <button class="stop" data-act="stop">■ Stop</button>`
-      : `<button class="primary" data-act="runAll">▶ Run all ${p.operations.length} APIs</button>
+      : `<button class="primary" data-act="runAll" ${testable.length ? "" : "disabled"}>▶ Run all ${testable.length} API${testable.length === 1 ? "" : "s"}</button>
+         ${nExcluded ? `<span class="meta">${nExcluded} excluded</span>` : ""}
          <button class="secondary" data-act="runSel" ${selected.size ? "" : "disabled"}>▶ Run selected (${selected.size})</button>
          <span class="grow"></span><span class="meta">Tests: ${esc(stages)}</span>`;
     $("[data-act=runAll]", runbar)?.addEventListener("click", () => startRun([]));
@@ -501,18 +523,21 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
     const term = q.value.toLowerCase();
     const shown = ops.filter((o) => (!term || `${o.method} ${o.path} ${o.summary} ${o.tags.join(" ")}`.toLowerCase().includes(term))
       && (!onlyIssues.checked || Object.keys(p.op_status[o.label]?.counts || {}).some((k) => k !== "info")));
+    const allSel = (list) => list.some((o) => !o.excluded) && list.filter((o) => !o.excluded).every((o) => selected.has(o.label));
     tbody.innerHTML = groupOps(shown).map(([tag, list]) => `
-      <tr class="group"><td class="c"><input type="checkbox" data-group="${esc(tag)}" ${list.every((o) => selected.has(o.label)) ? "checked" : ""}></td>
+      <tr class="group"><td class="c"><input type="checkbox" data-group="${esc(tag)}" ${allSel(list) ? "checked" : ""} ${list.every((o) => o.excluded) ? "disabled" : ""}></td>
         <td colspan="4">${esc(tag)} <span class="count">${list.length}</span></td></tr>
-      ${list.map((o) => `<tr class="op ${o.deprecated ? "deprecated" : ""}" data-label="${esc(o.label)}">
-        <td class="c"><input type="checkbox" data-op="${esc(o.label)}" ${selected.has(o.label) ? "checked" : ""}></td>
+      ${list.map((o) => `<tr class="op ${o.deprecated ? "deprecated" : ""} ${o.excluded ? "excluded" : ""}" data-label="${esc(o.label)}">
+        <td class="c"><input type="checkbox" data-op="${esc(o.label)}" ${selected.has(o.label) ? "checked" : ""} ${o.excluded ? "disabled" : ""}></td>
         <td>${methodBadge(o.method)}</td>
-        <td><div class="path">${esc(o.path)} ${o.secured ? '<span class="lock" title="Spec says this needs auth">🔒</span>' : ""}</div>
+        <td><div class="path">${esc(o.path)} ${o.secured ? '<span class="lock" title="Spec says this needs auth">🔒</span>' : ""}
+          ${o.excluded ? `<span class="tag-excluded" title="Matches Exclude paths in Settings; never tested">excluded</span>` : ""}</div>
           ${o.summary ? `<div class="summ">${esc(o.summary)}</div>` : ""}</td>
-        <td class="res">${resCell(o)}</td>
-        <td class="act"><button class="secondary small" data-run1="${esc(o.label)}" ${p.running ? "disabled" : ""} title="Test only this API">▶ Run</button></td>
+        <td class="res">${o.excluded && !p.op_status[o.label] ? `<span class="untested">excluded</span>` : resCell(o)}</td>
+        <td class="act"><button class="secondary small" data-run1="${esc(o.label)}" ${p.running || o.excluded ? "disabled" : ""}
+          title="${o.excluded ? "Excluded in Settings" : "Test only this API"}">▶ Run</button></td>
       </tr>`).join("")}`).join("") || `<tr><td colspan="5" class="none">No APIs match.</td></tr>`;
-    $("[data-act=all]", root).checked = shown.length > 0 && shown.every((o) => selected.has(o.label));
+    $("[data-act=all]", root).checked = allSel(shown);
   };
   render();
   q.addEventListener("input", render);
@@ -523,9 +548,9 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
     if (t.dataset.op) { t.checked ? selected.add(t.dataset.op) : selected.delete(t.dataset.op); }
     else if (t.dataset.group != null) {
       const list = groupOps(ops).find(([g]) => g === t.dataset.group)?.[1] || [];
-      list.forEach((o) => (t.checked ? selected.add(o.label) : selected.delete(o.label)));
+      list.filter((o) => !o.excluded).forEach((o) => (t.checked ? selected.add(o.label) : selected.delete(o.label)));
     } else if (t.dataset.act === "all") {
-      $$("tr.op", tbody).forEach((tr) => (t.checked ? selected.add(tr.dataset.label) : selected.delete(tr.dataset.label)));
+      $$("tr.op:not(.excluded)", tbody).forEach((tr) => (t.checked ? selected.add(tr.dataset.label) : selected.delete(tr.dataset.label)));
     } else return;
     onSelChange();
     render();
@@ -545,7 +570,8 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
     tr.after(detail);
     const rep = await getReport(s.run_id);
     const list = rep.stages.flatMap((st) => st.findings.map((f) => ({ ...f, stage: st.name }))).filter((f) => f.operation === label);
-    $("td", detail).innerHTML = `<div class="meta" style="padding:8px 0">From run <a href="#/r/${esc(s.run_id)}">${esc(fmtTime(s.started))}</a>${s.partial ? " (stopped early: some tests didn't run)" : ""}</div>
+    $("td", detail).innerHTML = `<div class="meta" style="padding:8px 0">From run <a href="#/r/${esc(s.run_id)}">${esc(fmtTime(s.started))}</a>${s.partial ? " (stopped early: some tests didn't run)" : ""}
+      · <a href="#/r/${esc(s.run_id)}?${new URLSearchParams({ view: "log", op: label })}">See every test sent to this API →</a></div>
       ${findingsHtml(list) || `<div class="none">No findings for this API.</div>`}`;
   });
 }
@@ -574,10 +600,13 @@ function findingsHtml(list) {
     </details></div>`).join("") + (list.length > 500 ? `<div class="none">Showing 500 of ${list.length}. Narrow the filter.</div>` : "");
 }
 
-async function pageRun(runId) {
+async function pageRun(runId, params = {}) {
   const tok = pageToken;
   const view = $("#view");
-  const filter = { sev: null, stage: "all", op: "", q: "" };
+  const filter = { sev: null, stage: "all", op: params.op || "", q: "" };
+  const logFilter = { stage: "", op: params.op || "", verdict: params.verdict || "", q: "" };
+  let resultView = params.view === "log" ? "log" : "findings";
+  let logTotal = null;
   let run;
 
   // Layout is built once; while the run is live only meta/toolbar/progress are updated in place,
@@ -593,13 +622,19 @@ async function pageRun(runId) {
           <div class="toolbar" data-out="toolbar"></div>
         </div>
         <ol class="progress" data-out="progress"></ol>
-        <div data-out="results"></div>`;
+        <div data-out="activity"></div>
+        <div class="exports" data-out="exports"></div>
+        <div class="tabs" data-out="viewtabs" role="tablist"></div>
+        <div data-out="results"></div>
+        <div data-out="log" hidden></div>`;
+      drawExports();
+      if (resultView === "log") drawLog();
     }
     const live = ["running", "stopping"].includes(run.status);
     const si = run.spec_info;
     const elapsed = (run.finished || Date.now() / 1000) - run.started;
     $("[data-out=meta]", view).innerHTML = `${run.operations?.length ? `<b>${run.operations.length}</b> selected API${run.operations.length > 1 ? "s" : ""}` : "All APIs"}
-      · started ${esc(fmtTime(run.started))} · ${fmtDur(elapsed)}${si ? ` · ${si.operations} APIs tested → <code>${esc(si.base_url)}</code>` : ""}
+      · started ${esc(fmtTime(run.started))} · ${fmtDur(elapsed)}${si ? ` · ${si.operations} API${si.operations === 1 ? "" : "s"} ${live ? "in this run" : "tested"} → <code>${esc(si.base_url)}</code>` : ""}
       ${run.error ? `<div class="error">${esc(run.error)}</div>` : ""}`;
     if (shownStatus !== run.status) {
       shownStatus = run.status;
@@ -608,8 +643,7 @@ async function pageRun(runId) {
         ${!live && run.project_id ? `<button class="secondary small" data-act="rerun">↻ Run again</button>` : ""}`;
       $("[data-act=stop]", view)?.addEventListener("click", async (e) => { e.target.disabled = true; await stopRun(runId); poll(); });
       $("[data-act=rerun]", view)?.addEventListener("click", async () => {
-        try { const { id } = await post(`/api/projects/${run.project_id}/runs`, { operations: run.operations || [] }); location.hash = `#/r/${id}`; }
-        catch (e) { toast(e.message, true); }
+        startProjectRun(run.project_id, run.operations || []);
       });
     }
     $("[data-out=progress]", view).innerHTML = run.stages_requested.map((s) => {
@@ -620,8 +654,170 @@ async function pageRun(runId) {
         return `<li class="${esc(st.status)}"><div class="name">${s}<small>${fmtDur(dur)}</small></div>
           <div class="st">${esc(label)}</div>${st.note ? `<div class="note">${esc(String(st.note).slice(0, 220))}</div>` : ""}</li>`;
       }).join("");
+    drawActivity(live);
+    drawViewTabs();
+    $("[data-out=results]", view).hidden = resultView !== "findings";
+    $("[data-out=log]", view).hidden = resultView !== "log";
     if (run.report) drawResults();
-    else if (live) $("[data-out=results]", view).innerHTML = `<p class="muted">Results appear here when the run finishes. You can leave this page; the test keeps running.</p>`;
+    else if (live) $("[data-out=results]", view).innerHTML = `<p class="muted">Findings appear here when the run finishes.
+      The <b>Test log</b> tab already shows every request sent so far. You can leave this page; the test keeps running.</p>`;
+  };
+
+  const drawExports = () => {
+    const u = (k) => `/api/runs/${encodeURIComponent(runId)}/download/${k}`;
+    const done = !["running", "stopping"].includes(run.status);
+    $("[data-out=exports]", view).innerHTML = `${done ? `<a class="btn-link primary-link" href="${u("view")}" target="_blank" rel="noopener"
+        title="Per API: what was tested, what wasn't and why, problems found, every input and output">📄 Open HTML report</a>
+      <a class="btn-link" href="${u("html")}" download>⬇ HTML report</a>` : ""}
+      <span class="meta">Download</span>
+      <a class="btn-link" href="${u("zip")}" download title="HTML report, test log, findings, spec and every tool's raw output">⬇ Everything (ZIP)</a>
+      <a class="btn-link" href="${u("csv")}" download title="One row per test; opens in Excel">⬇ Test log (CSV)</a>
+      <a class="btn-link" href="${u("ndjson")}" download title="One JSON object per test, with full requests and responses">⬇ Test log (NDJSON)</a>`;
+  };
+
+  const drawViewTabs = () => {
+    const nFind = run.report ? all().length : null;
+    $("[data-out=viewtabs]", view).innerHTML = [
+      ["findings", `Findings ${nFind != null ? `<span class="count">${nFind}</span>` : ""}`],
+      ["log", `Test log ${logTotal != null ? `<span class="count">${logTotal}</span>` : ""}`],
+    ].map(([k, l]) => `<button class="tab ${resultView === k ? "active" : ""}" data-view="${k}" role="tab">${l}</button>`).join("");
+    $$("[data-view]", view).forEach((b) => b.addEventListener("click", () => {
+      resultView = b.dataset.view;
+      $("[data-out=results]", view).hidden = resultView !== "findings";
+      $("[data-out=log]", view).hidden = resultView !== "log";
+      if (resultView === "log") drawLog();
+      drawViewTabs();
+    }));
+  };
+
+  /* ---------- test log ---------- */
+  let logItems = [];
+  const logQuery = (offset) => new URLSearchParams({ ...logFilter, offset, limit: 100 }).toString();
+
+  const drawLog = async (append = false) => {
+    const box = $("[data-out=log]", view);
+    let res;
+    try { res = await api(`/api/runs/${runId}/log?${logQuery(append ? logItems.length : 0)}`); }
+    catch (e) { box.innerHTML = `<p class="error">${esc(e.message)}</p>`; return; }
+    if (tok !== pageToken) return;
+    if (!res.available) {
+      box.innerHTML = `<div class="none">No test log for this run yet${["running", "stopping"].includes(run.status) ? ". It starts once the spec is loaded." : " (runs made before this feature don't have one)."}</div>`;
+      return;
+    }
+    logItems = append ? logItems.concat(res.items) : res.items;
+    const filtered = logFilter.stage || logFilter.op || logFilter.verdict || logFilter.q;
+    if (!filtered) logTotal = res.total;
+    drawViewTabs();
+    const live = ["running", "stopping"].includes(run.status);
+    const stageTotal = Object.values(res.stages).reduce((a, b) => a + b, 0);
+    if (!append) {
+      box.innerHTML = `
+        <div class="filters">
+          <div class="tabs">${[["", "all", stageTotal], ...Object.entries(res.stages).map(([s, n]) => [s, s, n])].map(([k, l, n]) =>
+            `<button class="tab ${logFilter.stage === k ? "active" : ""}" data-lstage="${esc(k)}">${esc(l)} <span class="count">${n}</span></button>`).join("")}</div>
+          <div class="right">
+            <select data-out="lop"><option value="">All APIs</option><option value="-" ${logFilter.op === "-" ? "selected" : ""}>Not tied to one API</option>
+              ${[...new Set([...res.operations, logFilter.op].filter((o) => o && o !== "-"))].sort().map((o) => `<option ${logFilter.op === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>
+            <input type="search" placeholder="Search requests, bodies…" data-out="lq" value="${esc(logFilter.q)}">
+          </div>
+        </div>
+        <div class="summary">${["fail", "pass", "error", "info"].map((v) =>
+          `<button class="pill v-${v} ${res.verdicts[v] ? "" : "zero"} ${logFilter.verdict === v ? "active" : ""}" data-lverdict="${v}"><b>${res.verdicts[v] || 0}</b>${v}</button>`).join("")}
+          ${live ? `<button class="secondary small" data-act="lrefresh">↻ Refresh</button>` : ""}</div>
+        <table class="log"><thead><tr><th>#</th><th>Stage</th><th>API</th><th>Scenario tested</th><th>Status</th><th>Verdict</th></tr></thead>
+          <tbody data-out="lrows"></tbody></table>
+        <div data-out="lmore"></div>`;
+      $$("[data-lstage]", box).forEach((b) => b.addEventListener("click", () => { logFilter.stage = b.dataset.lstage; drawLog(); }));
+      $$("[data-lverdict]", box).forEach((b) => b.addEventListener("click", () => {
+        logFilter.verdict = logFilter.verdict === b.dataset.lverdict ? "" : b.dataset.lverdict; drawLog(); }));
+      $("[data-out=lop]", box).addEventListener("change", (e) => { logFilter.op = e.target.value; drawLog(); });
+      let deb;
+      $("[data-out=lq]", box).addEventListener("input", (e) => {
+        clearTimeout(deb); deb = setTimeout(() => { logFilter.q = e.target.value; drawLog().then(() => {
+          const i = $("[data-out=lq]", box); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 350);
+      });
+      $("[data-act=lrefresh]", box)?.addEventListener("click", () => drawLog());
+      $("[data-out=lrows]", box).addEventListener("click", (e) => {
+        const tr = e.target.closest("tr[data-seq]");
+        if (tr) toggleEntry(tr);
+      });
+    }
+    $("[data-out=lrows]", box).insertAdjacentHTML("beforeend", res.items.map(logRow).join("") ||
+      (append ? "" : `<tr><td colspan="6" class="none">No tests match.</td></tr>`));
+    $("[data-out=lmore]", box).innerHTML = logItems.length < res.total
+      ? `<div class="actions"><button class="secondary" data-act="lmore">Load more (${logItems.length} of ${res.total})</button></div>`
+      : `<p class="hint">${res.total} test${res.total === 1 ? "" : "s"} shown.</p>`;
+    $("[data-act=lmore]", box)?.addEventListener("click", () => drawLog(true));
+  };
+
+  const logRow = (e) => `<tr data-seq="${e.seq}" class="lr v-${esc(e.verdict)}">
+    <td class="n">${e.seq}</td><td class="st">${esc(e.stage)}</td>
+    <td class="op">${e.operation ? opLabel(e.operation) : `<span class="muted">${esc(e.method || "")}</span>`}</td>
+    <td class="sc"><div>${esc(e.scenario)}</div>${e.verdict !== "pass" && (e.explanation || e.problem)
+      ? `<div class="pr v-${esc(e.verdict)}">${esc(e.explanation || e.problem)}</div>` : ""}</td>
+    <td class="code">${e.status ?? ""}</td><td><span class="verdict v-${esc(e.verdict)}">${esc(e.verdict)}</span></td></tr>`;
+
+  const kv = (obj) => obj && Object.keys(obj).length
+    ? `<table class="kv">${Object.entries(obj).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("")}</table>` : `<span class="muted">none</span>`;
+  const pretty = (s) => { if (s == null || s === "") return ""; try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } };
+
+  const toggleEntry = async (tr) => {
+    if (tr.nextElementSibling?.classList.contains("ldetail")) { tr.nextElementSibling.remove(); return; }
+    const d = document.createElement("tr");
+    d.className = "ldetail";
+    d.innerHTML = `<td colspan="6"><p class="muted">Loading…</p></td>`;
+    tr.after(d);
+    const e = await api(`/api/runs/${runId}/log/${tr.dataset.seq}`);
+    const rq = e.request, rs = e.response, det = { ...e.details };
+    const failures = det.failures; delete det.failures;
+    $("td", d).innerHTML = `<div class="entry">
+      <div class="grid2">
+        <div><h4>Scenario</h4><p>${esc(e.scenario)}</p><h4>Expected</h4><p>${esc(e.expected || "—")}</p></div>
+        <div><h4>Result</h4><p><span class="verdict v-${esc(e.verdict)}">${esc(e.verdict)}</span> · ${esc(new Date(e.ts * 1000).toLocaleString())}</p>
+          ${e.explanation ? `<p class="v-${esc(e.verdict)}">${esc(e.explanation)}</p>` : ""}
+          ${failures?.length > 1 ? `<h4>Every failed check</h4><ul class="fails">${failures.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}</div>
+      </div>
+      ${rq ? `<h4>Request</h4><p><code>${esc(rq.method)} ${esc(rq.url)}</code></p>${kv(rq.headers)}
+        ${rq.body ? `<pre>${esc(pretty(rq.body))}</pre>` : ""}` : ""}
+      ${rs ? `<h4>Response <span class="muted">HTTP ${esc(rs.status)}${rs.elapsed_ms != null ? ` · ${rs.elapsed_ms} ms` : ""}</span></h4>${kv(rs.headers)}
+        ${rs.body ? `<pre>${esc(pretty(rs.body))}</pre>` : `<p class="muted">Empty body</p>`}` : ""}
+      ${Object.keys(det).length ? `<h4>Details</h4><pre>${esc(JSON.stringify(det, null, 2))}</pre>` : ""}
+    </div>`;
+  };
+
+  const opLabel = (op) => {
+    if (!op) return "";
+    const [m, ...rest] = op.split(" ");
+    if (!METHOD_ORDER.includes(m.toLowerCase())) return esc(op);
+    return `${methodBadge(m.toLowerCase())} <code>${esc(rest.join(" "))}</code>`;
+  };
+  const feedHtml = (feed) => feed.slice().reverse().map((f) => `
+    <li class="lv-${esc(f.level || "info")}"><span class="t">${esc(new Date(f.t * 1000).toLocaleTimeString())}</span>
+      <span class="s">${esc(f.stage)}</span><span class="o">${opLabel(f.op)}</span><span class="m">${esc(f.msg)}</span></li>`).join("");
+
+  const drawActivity = (live) => {
+    const box = $("[data-out=activity]", view);
+    const feed = run.feed || [];
+    if (!live) {  // finished: keep the log, collapsed
+      box.innerHTML = feed.length ? `<details class="box activity-log"><summary>Activity log <span class="count">${feed.length}</span></summary>
+        <ol class="feed">${feedHtml(feed)}</ol></details>` : "";
+      return;
+    }
+    const a = run.activity;
+    const pct = a && a.total ? Math.min(100, Math.round((a.done || 0) / a.total * 100)) : null;
+    const counter = a && a.total ? (a.stage === "zap" ? `${a.done ?? 0}%` : `${a.done ?? 0} / ${a.total} APIs done`) : "";
+    const since = a ? Math.max(0, Math.round(Date.now() / 1000 - a.t)) : 0;
+    const scroll = $(".feed", box)?.scrollTop || 0;
+    requestAnimationFrame(() => { const f = $(".feed", box); if (f) f.scrollTop = scroll; });
+    box.innerHTML = `<section class="activity panel">
+      <div class="now">
+        <div class="now-head"><span class="live">${run.status === "stopping" ? "Stopping" : "Now"}</span>
+          ${a ? `<b>${esc(a.stage)}</b>${a.op ? ` · ${opLabel(a.op)}` : ""}` : `<span class="muted">Loading the spec…</span>`}</div>
+        ${a ? `<div class="now-msg">${esc(a.msg)}${since > 20 ? ` <span class="muted">(no update for ${since}s; the tool is still working)</span>` : ""}</div>` : ""}
+        ${pct != null ? `<div class="bar"><div style="width:${pct}%"></div></div><div class="meta">${esc(counter)}</div>` : ""}
+      </div>
+      ${feed.length ? `<h2>Activity</h2><ol class="feed">${feedHtml(feed.slice(-40))}</ol>` : ""}
+    </section>`;
   };
 
   const all = () => run.report.stages.flatMap((s) => s.findings.map((f) => ({ ...f, stage: s.name })));
@@ -673,7 +869,14 @@ async function pageRun(runId) {
     // don't wipe an expanded finding or filter input on every poll once results exist
     if (live || !view.dataset.final || view.dataset.final !== runId) draw();
     if (live) { clearTimeout(timer); timer = setTimeout(poll, 1500); }
-    else { view.dataset.final = runId; reportCache.delete(runId); }
+    else {
+      if (view.dataset.wasLive === runId) {
+        drawExports();  // the HTML report exists now
+        if (resultView === "log") drawLog();  // pick up the last entries
+      }
+      view.dataset.final = runId; reportCache.delete(runId);
+    }
+    if (live) view.dataset.wasLive = runId;
   }
   view.dataset.final = "";
   view.innerHTML = `<p class="muted">Loading…</p>`;

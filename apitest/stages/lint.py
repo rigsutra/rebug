@@ -6,7 +6,8 @@ import shutil
 from pathlib import Path
 
 from ..models import Finding, StageResult
-from ..proc import run_cmd
+from ..proc import progress, run_cmd
+from ..testlog import log_of
 
 SEV = {0: "high", 1: "medium", 2: "low", 3: "info"}  # spectral: error, warn, info, hint
 
@@ -26,6 +27,7 @@ def run(spec, cfg, out: Path) -> StageResult:
     ruleset.write_text('extends: ["spectral:oas"]\n', encoding="utf-8")
     cmd = [npx, "--yes", "--prefer-offline", "@stoplight/spectral-cli", "lint", str(spec_file),
            "--ruleset", str(ruleset), "-f", "json", "--quiet"]
+    progress(cfg, "lint", "Checking the Swagger document with Spectral")
     p = run_cmd(cmd, cancel=cfg.cancel, timeout=300)
     try:
         items = json.loads(p.stdout or "[]")
@@ -46,4 +48,19 @@ def run(spec, cfg, out: Path) -> StageResult:
         sev = SEV.get(it.get("severity", 3), "info")
         path = "/".join(str(x) for x in jp)
         res.findings.append(Finding("lint", sev, f"{it.get('code')}: {it.get('message')}", path))
+        tl = log_of(cfg)
+        if tl:
+            op = ""
+            if len(jp) >= 3 and jp[0] == "paths" and jp[2] in METHODS:
+                op = f"{jp[2].upper()} {jp[1]}"
+            tl.add("lint", f"Swagger rule `{it.get('code')}`", operation=op,
+                   expected="The Swagger document follows this OpenAPI rule", verdict="info" if sev == "info" else "fail",
+                   explanation=f"{it.get('message')} (at {path or 'document root'}).",
+                   details={"message": it.get("message"), "severity": sev, "spec_location": path,
+                            "line": (it.get("range") or {}).get("start", {}).get("line")})
+    if log_of(cfg) and not res.findings:
+        log_of(cfg).add("lint", "Spectral OpenAPI ruleset", expected="No rule violations", verdict="pass")
     return res
+
+
+METHODS = ("get", "put", "post", "delete", "patch", "head", "options")

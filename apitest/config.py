@@ -5,6 +5,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -27,7 +28,10 @@ class Config:
     timeout: float = 15.0
     types_max_fields: int = 60  # per operation, for the wrong-type probing stage
     operations: list[str] = field(default_factory=list)  # "GET /path" to test; empty = all
+    title: str = ""  # shown in reports (the project name in the web UI)
     cancel: threading.Event | None = field(default=None, repr=False, compare=False)
+    on_progress: Callable[[dict], None] | None = field(default=None, repr=False, compare=False)
+    testlog: object | None = field(default=None, repr=False, compare=False)  # testlog.TestLog, set by the runner
     zap_image: str = "ghcr.io/zaproxy/zaproxy:stable"
 
 

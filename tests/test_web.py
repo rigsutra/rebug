@@ -91,6 +91,54 @@ def test_run_selected_operations_and_per_api_status(client, monkeypatch):
     assert client.post(f"/api/projects/{pid}/runs", json={"operations": ["GET /nope"]}).status_code == 400
 
 
+def test_live_activity_feed_and_excluded_apis(client, monkeypatch):
+    monkeypatch.setenv("APITEST_TEST_VAR", "x")
+    pid = _create(client, exclude_paths=["^/slow$"])
+    ops = {o["label"]: o["excluded"] for o in client.get(f"/api/projects/{pid}").json()["operations"]}
+    assert ops == {"GET /a": False, "GET /b": False, "GET /slow": True}
+    assert client.get("/api/projects").json()[0]["excluded"] == 1
+    # selecting only excluded APIs is refused with a clear message
+    r = client.post(f"/api/projects/{pid}/runs", json={"operations": ["GET /slow"]})
+    assert r.status_code == 400 and "excluded" in r.text
+    run = _wait(client, client.post(f"/api/projects/{pid}/runs", json={}).json()["id"])
+    assert run["tested"] == ["GET /a", "GET /b"]
+    feed = run["feed"]
+    assert {f["op"] for f in feed if f["op"]} == {"GET /a", "GET /b"}  # excluded API never touched
+    assert any(f["msg"].startswith("Finished") and f["stage"] == "authz" for f in feed)
+    assert any(f["level"] == "bad" and f["op"] == "GET /b" for f in feed)  # /b accepts no credentials
+
+
+def test_test_log_browse_filter_and_download(client, monkeypatch):
+    import csv, io, json, zipfile
+    monkeypatch.setenv("APITEST_TEST_VAR", "env-secret-value")
+    pid = _create(client)
+    rid = _wait(client, client.post(f"/api/projects/{pid}/runs", json={}).json()["id"])["id"]
+    log = client.get(f"/api/runs/{rid}/log").json()
+    assert log["available"] and log["total"] >= 3 and log["stages"] == {"authz": log["total"]}
+    fails = client.get(f"/api/runs/{rid}/log", params={"verdict": "fail", "op": "GET /b"}).json()
+    no_cred = [i for i in fails["items"] if "no credentials" in i["scenario"]]
+    assert no_cred and no_cred[0]["status"] == 200 and no_cred[0]["expected"].startswith("Refused")
+    assert "anyone can call this API" in no_cred[0]["explanation"]
+    full = client.get(f"/api/runs/{rid}/log/{no_cred[0]['seq']}").json()
+    assert full["request"]["method"] == "GET" and full["response"]["status"] == 200
+    # secrets are masked everywhere: header values and the env-provided value
+    for kind in ("ndjson", "csv", "zip"):
+        r = client.get(f"/api/runs/{rid}/download/{kind}")
+        assert r.status_code == 200 and "attachment" in r.headers["content-disposition"]
+        blob = r.content
+        if kind == "zip":
+            z = zipfile.ZipFile(io.BytesIO(blob))
+            names = [n.split("/", 1)[1] for n in z.namelist()]
+            assert {"test-log.ndjson", "test-log.csv", "report.json", "run.json", "README.txt"} <= set(names)
+            blob = b"".join(z.read(n) for n in z.namelist())
+        assert b"literal-secret" not in blob and b"env-secret-value" not in blob
+    rows = list(csv.DictReader(io.StringIO(client.get(f"/api/runs/{rid}/download/csv").content.decode("utf-8-sig"))))
+    assert len(rows) == log["total"] and {"scenario", "expected", "verdict", "status"} <= set(rows[0])
+    public = [json.loads(l) for l in client.get(f"/api/runs/{rid}/download/ndjson").text.splitlines()
+              if '"GET /a"' in l]
+    assert public[0]["request"]["headers"]["authorization"] == "Bearer ***"
+
+
 def test_missing_env_var_is_a_clear_error(client, monkeypatch):
     monkeypatch.setenv("APITEST_TEST_VAR", "x")
     pid = _create(client)

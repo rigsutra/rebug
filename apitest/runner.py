@@ -13,6 +13,8 @@ from .proc import Cancelled
 from .report import write_reports
 from .spec import METHODS, Spec, filter_operations, load_spec
 from .stages import authz, conformance, lint, types, zap
+from . import coverage, htmlreport
+from .testlog import TestLog, write_csv
 
 STAGE_FUNCS = {"lint": lint.run, "conformance": conformance.run, "types": types.run,
                "authz": authz.run, "zap": zap.run}
@@ -26,9 +28,11 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     emit({"type": "spec_loading", "spec": cfg.spec})
+    started = time.time()
     spec = load_spec(cfg.spec, cfg.headers, cfg.timeout)
     if cfg.operations:
         spec = filter_operations(spec, cfg.operations)
+    all_ops = list(spec.operations)  # before exclusions, so the report can say what was excluded
     if cfg.exclude_paths:
         # Apply exclusions here, once, so every stage (including ZAP, which scans the whole
         # document it's given) skips them
@@ -40,6 +44,7 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
     base = cfg.base_url or spec.base_url
     emit({"type": "spec", "version": spec.version, "operations": len(spec.operations), "base_url": base,
           "labels": [o.label for o in spec.operations]})
+    cfg.testlog = TestLog(out / "test-log.ndjson", list(cfg.headers.values()) + list(cfg.headers_b.values()))
 
     results: list[StageResult] = []
     cancelled = False
@@ -66,7 +71,16 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
 
     annotate(spec, base, results)
     write_reports(out, cfg.spec, base, results)
-    emit({"type": "cancelled" if cancelled else "done", "report": str(out / "report.html")})
+    write_csv(out / "test-log.ndjson", out / "test-log.csv")
+    settings = {"stages": cfg.stages, "headers": cfg.headers, "headers_b": cfg.headers_b, "bola": cfg.bola,
+                "exclude_paths": cfg.exclude_paths, "operations": cfg.operations}
+    cov = coverage.build(all_ops, settings, {r.name: {"status": r.status, "note": r.note} for r in results},
+                         out / "test-log.ndjson")
+    coverage.write(cov, out)
+    htmlreport.build(out, {"project_name": cfg.title, "spec": cfg.spec, "status": "cancelled" if cancelled else "done",
+                           "started": started, "finished": time.time(), "operations": cfg.operations,
+                           "headers": bool(cfg.headers), "headers_b": bool(cfg.headers_b)}, cov)
+    emit({"type": "cancelled" if cancelled else "done", "report": str(out / "test-report.html")})
     return results
 
 

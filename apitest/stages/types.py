@@ -20,7 +20,9 @@ from pathlib import Path
 import httpx
 
 from ..models import Finding, StageResult
-from ..proc import check
+from ..proc import check, progress
+from ..explain import server_said
+from ..testlog import log_of
 from ..spec import resolve
 from .authz import _url
 
@@ -238,17 +240,24 @@ def run(spec, cfg, out: Path) -> StageResult:
     raw = spec.raw
     probed = skipped = sent = 0
     log = []
+    candidates = []
+    for op in spec.operations:
+        if op.method not in WRITE_METHODS or any(re.search(p, op.path) for p in cfg.exclude_paths):
+            continue
+        schema, example = body_schema(raw, op)
+        if schema is not None:
+            candidates.append((op, schema, example))
+    if not candidates:
+        res.note = "No POST/PUT/PATCH operations with a JSON body to probe"
+        progress(cfg, "types", res.note)
+        return res
     with httpx.Client(timeout=cfg.timeout, follow_redirects=False) as c:
-        for op in spec.operations:
-            if op.method not in WRITE_METHODS or any(re.search(p, op.path) for p in cfg.exclude_paths):
-                continue
-            schema, example = body_schema(raw, op)
-            if schema is None:
-                continue
+        for i, (op, schema, example) in enumerate(candidates, 1):
             baseline = example if example is not None else sample(raw, schema)
             if not isinstance(baseline, (dict, list)):
                 continue
             url = _url(base, op.path, op.path_params)
+            progress(cfg, "types", "Sending a valid baseline body", op=op.label, done=i - 1, total=len(candidates))
 
             def send(body):
                 nonlocal sent
@@ -257,13 +266,30 @@ def run(spec, cfg, out: Path) -> StageResult:
                 return c.request(op.method.upper(), url, headers=cfg.headers,
                                  params=op.query_params, json=body)
 
+            tl = log_of(cfg)
             try:
                 r = send(baseline)
             except httpx.HTTPError as e:
                 res.findings.append(Finding("types", "info", "Request failed", op.label, str(e)))
+                if tl:
+                    tl.add_error("types", "Valid baseline body", op.method.upper(), url, str(e), op.label)
                 continue
+            if tl:
+                ok_b = 200 <= r.status_code < 300
+                tl.add_httpx("types", "Valid request first (every field the correct type)", r, operation=op.label,
+                             expected="2xx: a valid body is accepted",
+                             verdict="pass" if ok_b else "error",
+                             explanation=f"Accepted with HTTP {r.status_code}; wrong-type checks start from this request."
+                             if ok_b else
+                             f"Even this valid request was refused (HTTP {r.status_code}"
+                             + (f": {server_said(r.text)}" if server_said(r.text) else "") + "), so the wrong-type "
+                             "checks for this API were not run: a refusal wouldn't prove anything. "
+                             + ("Set a valid token for user A." if r.status_code in (401, 403) else
+                                "Add a working `example` to this request body in the Swagger."))
             if not 200 <= r.status_code < 300:
                 skipped += 1
+                progress(cfg, "types", f"Skipped: valid baseline body got HTTP {r.status_code}", op=op.label,
+                         done=i, total=len(candidates), level="warn")
                 res.findings.append(Finding(
                     "types", "info", f"Type probing skipped: valid baseline body got HTTP {r.status_code}",
                     op.label,
@@ -272,17 +298,40 @@ def run(spec, cfg, out: Path) -> StageResult:
                     f"{json.dumps(baseline, indent=2)[:1200]}\n\nResponse:\n{r.text[:400]}"))
                 continue
             probed += 1
-            for fpath, types, required in list(fields(raw, schema, baseline))[: cfg.types_max_fields]:
+            flist = list(fields(raw, schema, baseline))[: cfg.types_max_fields]
+            for fi, (fpath, types, required) in enumerate(flist, 1):
+                progress(cfg, "types", f"Field {fi}/{len(flist)} `{path_str(fpath)}` ({'/'.join(sorted(types))}): "
+                                       "sending wrong types", op=op.label, done=i - 1, total=len(candidates))
                 accepted, crashed, null_ok = [], [], False
                 for declared in sorted(types - {"null"}):
                     for label, bad in MUTATIONS.get(declared, []):
                         if _json_type_ok(bad, types):
                             continue  # that value is legitimately allowed
+                        scenario = (f"Field `{path_str(fpath)}` should be {'/'.join(sorted(types))}; "
+                                    f"sent {json.dumps(bad)} ({label}) instead")
                         try:
                             rr = send(set_at(baseline, fpath, bad))
-                        except httpx.HTTPError:
+                        except httpx.HTTPError as e:
+                            if tl:
+                                tl.add_error("types", scenario, op.method.upper(), url, str(e), op.label)
                             continue
                         log.append(f"{op.label} {path_str(fpath)}={json.dumps(bad)} -> {rr.status_code}")
+                        if tl:
+                            ok = 400 <= rr.status_code < 500
+                            fname = path_str(fpath)
+                            expl = (f"Refused with HTTP {rr.status_code}, as it should." if ok else
+                                    f"The server crashed (HTTP {rr.status_code}) when `{fname}` was {json.dumps(bad)}."
+                                    if rr.status_code >= 500 else
+                                    f"Accepted `{fname}` = {json.dumps(bad)} ({label}) with HTTP {rr.status_code}, "
+                                    f"although the Swagger says it must be {'/'.join(sorted(types))}. Bad data can "
+                                    "get into the system this way.")
+                            tl.add_httpx("types", scenario, rr, operation=op.label,
+                                         expected="4xx: the wrong type must be rejected",
+                                         verdict="pass" if ok else "fail", explanation=expl,
+                                         details={"field": path_str(fpath), "declared_type": sorted(types),
+                                                  "sent_value": bad, "required": required,
+                                                  "problem": "" if ok else ("server crashed (5xx)" if rr.status_code >= 500
+                                                                           else "wrong type accepted")})
                         if 200 <= rr.status_code < 300:
                             if bad is None:
                                 null_ok = True
@@ -308,6 +357,12 @@ def run(spec, cfg, out: Path) -> StageResult:
                     res.findings.append(Finding(
                         "types", "high", f"Field `{name}` ({declared_s}) crashed the server on wrong type",
                         op.label, "\n".join(crashed)))
+                if accepted or crashed:
+                    progress(cfg, "types", f"`{name}` " + ("crashed on: " + ", ".join(crashed) if crashed
+                             else "accepted: " + ", ".join(accepted)), op=op.label, done=i - 1,
+                             total=len(candidates), level="bad")
+            progress(cfg, "types", f"Done: {len(flist)} field(s) probed", op=op.label, done=i,
+                     total=len(candidates), level="ok")
     (out / "types.log").write_text("\n".join(log), encoding="utf-8")
     res.note = f"{probed} operation(s) probed, {skipped} skipped (baseline rejected), {sent} requests"
     return res

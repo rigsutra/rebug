@@ -1,6 +1,7 @@
 """Type safety / conformance + fuzzing via Schemathesis."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -8,7 +9,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from ..models import Finding, StageResult
-from ..proc import run_cmd
+from ..proc import Tail, progress, run_cmd
+from ..explain import PHASES, describe_case, expected_for, explain_check, phase_label, server_said
+from ..testlog import b64_or_text, log_of
 
 
 def run(spec, cfg, out: Path) -> StageResult:
@@ -18,6 +21,7 @@ def run(spec, cfg, out: Path) -> StageResult:
         res.status, res.note = "error", "No base URL (pass --base-url)"
         return res
     junit = out / "schemathesis-junit.xml"
+    events = out / "schemathesis-events.ndjson"
     if cfg.spec.startswith("http") and not spec.from_page and not spec.filtered:
         schema_arg = cfg.spec
     else:  # local file, spec embedded in a Swagger UI page, or reduced to selected operations
@@ -26,7 +30,8 @@ def run(spec, cfg, out: Path) -> StageResult:
     cmd = [sys.executable, "-m", "schemathesis.cli", "run", schema_arg, "--url", base,
            "--checks", "all", "--max-examples", str(cfg.max_examples),
            "--continue-on-failure", "--no-color",
-           "--report", "junit", "--report-junit-path", str(junit)]
+           "--report", "junit,ndjson", "--report-junit-path", str(junit),
+           "--report-ndjson-path", str(events)]
     for k, v in cfg.headers.items():
         cmd += ["-H", f"{k}: {v}"]
     for pat in cfg.exclude_paths:
@@ -34,7 +39,14 @@ def run(spec, cfg, out: Path) -> StageResult:
     # Schemathesis chokes on PYTHONIOENCODING values like "utf-8:surrogateescape" (Windows)
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     junit.unlink(missing_ok=True)
-    p = run_cmd(cmd, cancel=cfg.cancel, timeout=1800, env=env)
+    events.unlink(missing_ok=True)
+    progress(cfg, "conformance", "Starting Schemathesis", total=len(spec.operations))
+    live = _Live(cfg, len(spec.operations), Tail(events))
+    try:
+        p = run_cmd(cmd, cancel=cfg.cancel, timeout=1800, env=env, on_tick=lambda _lines: live.tick())
+    finally:  # also on Stop: log whatever Schemathesis finished
+        n = log_scenarios(cfg, events)
+        progress(cfg, "conformance", f"Logged {n} request(s) to the test log")
     (out / "schemathesis.log").write_text(p.stdout + "\n" + p.stderr, encoding="utf-8")
     root = ET.parse(junit).getroot() if junit.exists() else None
     if root is None or not list(root.iter("testcase")):
@@ -48,6 +60,117 @@ def run(spec, cfg, out: Path) -> StageResult:
         for el in case.findall("failure") + case.findall("error"):
             res.findings += _split_checks(name, (el.text or el.get("message") or "").strip())
     return res
+
+
+def scenario_cases(body: dict):
+    """Yield one readable dict per request inside a Schemathesis ScenarioFinished event."""
+    rec = body.get("recorder") or {}
+    phase = body.get("phase", "")
+    cases, inters, checks = rec.get("cases") or {}, rec.get("interactions") or {}, rec.get("checks") or {}
+    for cid, inter in inters.items():
+        case = (cases.get(cid) or {}).get("value") or {}
+        meta = case.get("meta") or {}
+        mode = (meta.get("generation") or {}).get("mode", "")
+        desc = ((meta.get("phase") or {}).get("data") or {}).get("description") or ""
+        rq, rs = inter.get("request") or {}, inter.get("response") or {}
+        status = rs.get("status_code")
+        ck = checks.get(cid) or []
+        failures, failures_raw = [], []
+        for c in ck:
+            if c.get("status") == "failure":
+                f = (c.get("failure_info") or {}).get("failure") or {}
+                failures.append(explain_check(c.get("name", ""), status, f))
+                failures_raw.append(f"{f.get('title') or c.get('name')}: {(f.get('message') or '').strip()}")
+        resp_body = b64_or_text(rs.get("content"))
+        if failures and status and status >= 500 and server_said(resp_body):
+            failures[0] = failures[0].split(" Server said:")[0] + f" Server said: {server_said(resp_body)}"
+        yield {
+            "phase": phase, "mode": mode, "case_id": case.get("id"), "ts": inter.get("timestamp"),
+            "operation": f"{(case.get('method') or rq.get('method', '')).upper()} {case.get('path', '')}".strip()
+                         if case.get("path") else "",
+            "scenario": describe_case(phase, mode, desc), "expected": expected_for(mode),
+            "request": {"method": rq.get("method", ""), "url": rq.get("uri", ""), "headers": rq.get("headers"),
+                        "body": b64_or_text(rq.get("body"))},
+            "response": {"status": status, "headers": rs.get("headers"), "body": resp_body,
+                         "elapsed_ms": round(rs["elapsed"] * 1000, 1) if rs.get("elapsed") is not None else None}
+                        if rs else None,
+            "checks": [{"name": c.get("name"), "status": c.get("status")} for c in ck],
+            "failures": failures, "failures_raw": failures_raw,
+        }
+
+
+class _Live:
+    """Turns Schemathesis's NDJSON event stream into progress updates people can read."""
+
+    def __init__(self, cfg, total: int, tail: Tail):
+        self.cfg, self.total, self.tail = cfg, total, tail
+        self.phase, self.done = "", 0
+
+    def tick(self) -> None:
+        for line in self.tail.lines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind, body = next(iter(ev.items()))
+            if kind == "PhaseStarted":
+                name = body.get("phase", {}).get("name", "")
+                if body.get("phase", {}).get("is_enabled", True) and name != "probing":
+                    self.phase, self.done = name, 0
+                    progress(self.cfg, "conformance", f"Now running: {phase_label(name)}. "
+                             f"{PHASES.get(name, ('', ''))[1]}", done=0, total=self.total)
+            elif kind == "ScenarioFinished":
+                label = (body.get("recorder") or {}).get("label", "")
+                if not label or body.get("status") == "skip":
+                    continue
+                cases = list(scenario_cases(body))
+                bad = [c for c in cases if c["failures"]]
+                head = phase_label(self.phase)
+                if bad:
+                    c = bad[0]
+                    code = (c["response"] or {}).get("status")
+                    text = f"{c['scenario']} → got HTTP {code}. {c['failures'][0]}"
+                    if len(bad) > 1:
+                        text += f" (+{len(bad) - 1} more failing request{'s' if len(bad) > 2 else ''})"
+                else:
+                    text = f"{head}: {len(cases)} request{'s' if len(cases) != 1 else ''} sent, all checks passed"
+                level = "bad" if bad else "ok"
+                if not re.match(r"^(GET|PUT|POST|DELETE|PATCH|HEAD|OPTIONS) /", label):
+                    progress(self.cfg, "conformance", text, level=level)  # request chains aren't one API
+                    continue
+                self.done = min(self.done + 1, self.total)
+                progress(self.cfg, "conformance", text, op=label, done=self.done, total=self.total, level=level)
+
+
+def log_scenarios(cfg, events: Path) -> int:
+    """Write every request Schemathesis made (from its NDJSON event stream) to the test log."""
+    tl = log_of(cfg)
+    if tl is None or not events.is_file():
+        return 0
+    n = 0
+    for line in events.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            body = json.loads(line).get("ScenarioFinished")
+        except ValueError:
+            continue
+        if not body:
+            continue
+        for c in scenario_cases(body):
+            code = (c["response"] or {}).get("status")
+            if c["failures"]:
+                explanation = " ".join(c["failures"])
+            elif c["mode"] == "negative":
+                explanation = f"Refused with HTTP {code}, as it should."
+            else:
+                explanation = f"Answered HTTP {code}; the response matches the Swagger."
+            tl.add("conformance", c["scenario"], operation=c["operation"], expected=c["expected"],
+                   verdict="fail" if c["failures"] else "pass", ts=c["ts"], explanation=explanation,
+                   request=c["request"], response=c["response"],
+                   details={"phase": c["phase"], "phase_meaning": PHASES.get(c["phase"], ("", ""))[1],
+                            "generation_mode": c["mode"], "case_id": c["case_id"], "checks": c["checks"],
+                            "failures": c["failures"], "tool_messages": c["failures_raw"]})
+            n += 1
+    return n
 
 
 # Schemathesis check titles -> severity. Anything unlisted is "medium".
