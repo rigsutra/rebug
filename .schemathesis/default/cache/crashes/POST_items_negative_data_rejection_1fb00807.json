@@ -1,0 +1,88 @@
+{
+  "operation": "POST /items",
+  "method": "POST",
+  "path_template": "/items",
+  "fingerprint": "1fb00807",
+  "case_id": "1SJFWi",
+  "code_sample": "curl -X POST -H 'Content-Type: application/json' -d '{\"id\": 0, \"name\": \"\", \"price\": false}' http://localhost:8000/items",
+  "sequence": [
+    {
+      "method": "POST",
+      "url": "http://localhost:8000/items",
+      "url_template": "http://localhost:8000/items",
+      "headers": {
+        "User-Agent": "schemathesis/4.29.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Schemathesis-TestCaseId": "1SJFWi",
+        "Content-Type": "application/json",
+        "Content-Length": "37"
+      },
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "date": "Fri, 02 Oct 2026 07:01:52 GMT",
+          "server": "uvicorn",
+          "content-length": "30",
+          "content-type": "application/json"
+        },
+        "body": "{\"id\":0,\"name\":\"\",\"price\":0.0}"
+      },
+      "link": null,
+      "checks": [
+        {
+          "name": "negative_data_rejection",
+          "status": "failure",
+          "message": "API accepted schema-violating request\n\nInvalid data should have been rejected\nExpected: 400, 401, 403, 404, 405, 406, 409, 415, 422, 428, 429, 5xx\nInvalid component: in body - price: Incorrect type"
+        }
+      ],
+      "meta": {
+        "generation": {
+          "time": 7.579999510198832e-05,
+          "mode": "negative"
+        },
+        "components": {
+          "BODY": "negative"
+        },
+        "phase": {
+          "name": "coverage",
+          "data": {
+            "type": "CoveragePhaseData",
+            "description": "price: Incorrect type",
+            "location": "/properties/price/type",
+            "parameter": "application/json",
+            "parameter_location": "BODY",
+            "scenario": "incorrect_type"
+          }
+        },
+        "pool_draws": [],
+        "pool_misses": [
+          [
+            "body",
+            "id"
+          ]
+        ],
+        "semantic_draws": [],
+        "dictionary_draws": [],
+        "constants_draws": [],
+        "raw_containers": {}
+      },
+      "path": "/items",
+      "path_parameters": {},
+      "query": {},
+      "case_headers": {},
+      "cookies": {},
+      "case_body": {
+        "encoding": "json",
+        "value": {
+          "id": 0,
+          "name": "",
+          "price": false
+        }
+      },
+      "media_type": "application/json",
+      "parent_index": null
+    }
+  ]
+}

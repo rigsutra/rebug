@@ -1,0 +1,689 @@
+"use strict";
+
+/* ================= utilities ================= */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const SEVS = ["critical", "high", "medium", "low", "info"];
+const METHOD_ORDER = ["get", "post", "put", "patch", "delete", "head", "options"];
+const STAGE_INFO = {
+  lint: "Spec quality: missing schemas, bad refs, naming (Spectral)",
+  conformance: "Responses match the declared types; fuzzing, 500s, undocumented status codes (Schemathesis)",
+  types: "Each request-body field gets wrong data types (\"1\" for int, \"true\"/1 for bool…); must be rejected",
+  authz: "No/invalid tokens on secured endpoints, cross-user (BOLA) access, stack-trace leaks, headers",
+  zap: "OWASP ZAP API scan: injection, misconfiguration (Docker)",
+};
+
+let env = { stages: Object.keys(STAGE_INFO), available: {}, reasons: {} };
+let timer = null;           // the current page's poll timer
+let pageToken = 0;          // bumps on navigation so stale async renders are dropped
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const ct = r.headers.get("content-type") || "";
+  const body = ct.includes("json") ? await r.json() : await r.text();
+  if (!r.ok) throw new Error(typeof body === "string" ? body : body.detail || JSON.stringify(body));
+  return body;
+}
+const post = (path, data) => api(path, { method: "POST", body: JSON.stringify(data ?? {}) });
+
+function toast(msg, err = false) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "toast" + (err ? " err" : "");
+  t.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => (t.hidden = true), err ? 6000 : 2500);
+}
+
+function fmtTime(t) { return t ? new Date(t * 1000).toLocaleString() : ""; }
+function fmtAgo(t) {
+  if (!t) return "";
+  const s = Date.now() / 1000 - t;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return new Date(t * 1000).toLocaleDateString();
+}
+function fmtDur(s) { return s == null ? "" : s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`; }
+function methodBadge(m) { return `<span class="method ${esc(m)}">${esc(m.toUpperCase())}</span>`; }
+function miniCounts(c) {
+  if (!c) return "";
+  const parts = SEVS.filter((s) => c[s] && s !== "info").map((s) => `<span class="${s}" title="${s}">${c[s]} ${s[0].toUpperCase()}</span>`);
+  return parts.length ? `<span class="mini">${parts.join("")}</span>` : `<span class="mini"><span class="low" style="color:var(--ok)">clean</span></span>`;
+}
+
+function dialog(title, bodyHtml, buttons) {
+  const d = $("#dialog");
+  $("#dialogTitle").textContent = title;
+  $("#dialogBody").innerHTML = bodyHtml;
+  const acts = $("#dialogActions");
+  acts.innerHTML = "";
+  return new Promise((resolve) => {
+    for (const b of buttons) {
+      const el = document.createElement("button");
+      el.className = b.cls || "secondary";
+      el.textContent = b.label;
+      el.addEventListener("click", () => { if (b.onClick) b.onClick(); d.close(); resolve(b.value); });
+      acts.appendChild(el);
+    }
+    d.addEventListener("close", () => resolve(undefined), { once: true });
+    d.showModal();
+  });
+}
+const confirmDialog = (title, html, label = "Delete") =>
+  dialog(title, html, [{ label, cls: "danger", value: true }, { label: "Cancel", value: false }]);
+
+function crumbs(items) {
+  $("#crumbs").innerHTML = items.map(([label, href]) => href ? `<a href="${href}">${esc(label)}</a>` : `<b>${esc(label)}</b>`).join(" › ");
+}
+
+/* ================= router ================= */
+
+function route() {
+  clearTimeout(timer);
+  pageToken++;
+  const h = location.hash.replace(/^#/, "") || "/";
+  let m;
+  if (h === "/") return pageProjects();
+  if (h === "/new") return pageProjectForm(null);
+  if ((m = h.match(/^\/p\/([\w-]+)(?:\/(\w+))?$/))) return pageProject(m[1], m[2] || "apis");
+  if ((m = h.match(/^\/r\/([\w-]+)$/))) return pageRun(m[1]);
+  location.hash = "#/";
+}
+
+/* ================= projects list ================= */
+
+async function pageProjects() {
+  const tok = pageToken;
+  crumbs([["Projects"]]);
+  const view = $("#view");
+  let projects;
+  try { projects = await api("/api/projects"); } catch (e) { view.innerHTML = `<p class="error">${esc(e.message)}</p>`; return; }
+  if (tok !== pageToken) return;
+  if (!projects.length) {
+    view.innerHTML = `<div class="empty panel"><h2>No projects yet</h2>
+      <p>A project is one API application: its Swagger, base URL, test users and settings.<br>
+      Enter the app's URL and apitest finds its Swagger and lists every API.</p>
+      <button class="primary" onclick="location.hash='#/new'">+ New project</button></div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Projects</h1><div class="meta">${projects.length} project${projects.length === 1 ? "" : "s"}</div></div>
+      <button class="primary" onclick="location.hash='#/new'">+ New project</button></div>
+    <div class="cards">${projects.map(projectCard).join("")}</div>`;
+  $$("[data-run-all]").forEach((b) => b.addEventListener("click", async () => {
+    try { const { id } = await post(`/api/projects/${b.dataset.runAll}/runs`, { operations: [] }); location.hash = `#/r/${id}`; }
+    catch (e) { toast(e.message, true); }
+  }));
+  $$("[data-stop]").forEach((b) => b.addEventListener("click", () => stopRun(b.dataset.stop).then(pageProjects)));
+  if (projects.some((p) => p.running)) timer = setTimeout(() => tok === pageToken && pageProjects(), 3000);
+}
+
+function projectCard(p) {
+  const si = p.spec_info || {};
+  const last = p.last_run;
+  const lastHtml = p.running
+    ? `<span class="live">Running</span> <a href="#/r/${esc(p.running)}">view</a>`
+    : last ? `<span class="status ${esc(last.status)}" style="font-size:11.5px;padding:1px 8px">${esc(last.status)}</span>
+        ${miniCounts(last.counts)} <span class="muted">${esc(fmtAgo(last.started))}${last.partial ? " · selected APIs" : ""}</span>
+        <a href="#/r/${esc(last.id)}">results</a>`
+    : `<span class="muted">Never run</span>`;
+  return `<div class="card">
+    <h3><a href="#/p/${esc(p.id)}">${esc(p.name)}</a></h3>
+    ${p.description ? `<div class="desc">${esc(p.description)}</div>` : ""}
+    <div class="meta">${esc(si.title || "")} ${esc(si.api_version || "")} · <b>${p.operations}</b> APIs</div>
+    <div class="spec">${esc(p.spec)}</div>
+    <div class="last">${lastHtml}</div>
+    <div class="toolbar">
+      ${p.running ? `<button class="stop small" data-stop="${esc(p.running)}">■ Stop</button>`
+                  : `<button class="primary small" data-run-all="${esc(p.id)}">▶ Run all APIs</button>`}
+      <button class="secondary small" onclick="location.hash='#/p/${esc(p.id)}'">Open</button>
+    </div></div>`;
+}
+
+async function stopRun(runId) {
+  try { await post(`/api/runs/${runId}/cancel`); toast("Stopping…"); }
+  catch (e) { toast(e.message, true); }
+}
+
+/* ================= project form (new + settings) ================= */
+
+function stageChecks(selected) {
+  return env.stages.map((s) => {
+    const avail = env.available[s] !== false;
+    const checked = (!selected || selected.includes(s));
+    return `<label class="stage-opt ${avail ? "" : "disabled"}" title="${esc(env.reasons[s] || "")}">
+      <input type="checkbox" name="stage" value="${s}" ${checked ? "checked" : ""}>
+      <b>${s}</b><span>${esc(avail ? STAGE_INFO[s] : `${STAGE_INFO[s]}. Unavailable right now: ${env.reasons[s]}, so it will be reported as skipped.`)}</span></label>`;
+  }).join("");
+}
+
+function pathParams(path) { return [...path.matchAll(/{(\w+)}/g)].map((m) => m[1]); }
+
+function bolaRow(container, ops, sc = { method: "GET", path: "", params: {} }) {
+  const row = document.createElement("div");
+  row.className = "bola-row";
+  row.innerHTML = `
+    <select class="b-method">${["GET", "PUT", "PATCH", "DELETE", "POST"].map((m) => `<option ${m === sc.method ? "selected" : ""}>${m}</option>`).join("")}</select>
+    <input class="b-path" list="opPaths" placeholder="/orders/{orderId}" value="${esc(sc.path)}">
+    <button type="button" class="icon" title="Remove">✕</button>
+    <div class="params"></div>`;
+  const renderParams = () => {
+    const box = $(".params", row);
+    const prev = Object.fromEntries($$("input", box).map((i) => [i.dataset.k, i.value]));
+    box.innerHTML = pathParams($(".b-path", row).value).map((k) =>
+      `<label>${esc(k)} <input data-k="${esc(k)}" placeholder="owned by user A" value="${esc(prev[k] ?? sc.params?.[k] ?? "")}"></label>`).join("");
+  };
+  $(".b-path", row).addEventListener("input", renderParams);
+  $(".b-path", row).addEventListener("change", (e) => {
+    const op = ops.find((o) => o.path === e.target.value && o.method !== "post");
+    if (op) $(".b-method", row).value = op.method.toUpperCase();
+  });
+  $(".icon", row).addEventListener("click", () => row.remove());
+  container.appendChild(row);
+  renderParams();
+}
+
+function readBola(container) {
+  return $$(".bola-row", container).map((row) => ({
+    method: $(".b-method", row).value,
+    path: $(".b-path", row).value.trim(),
+    params: Object.fromEntries($$(".params input", row).map((i) => [i.dataset.k, i.value.trim()])),
+  })).filter((b) => b.path);
+}
+
+function apiListPreview(ops) {
+  if (!ops?.length) return `<div class="none">This document has no operations.</div>`;
+  return `<table class="apis">${groupOps(ops).map(([tag, list]) => `
+    <tr class="group"><td colspan="3">${esc(tag)} <span class="count">${list.length}</span></td></tr>
+    ${list.map((o) => `<tr class="op"><td style="width:70px">${methodBadge(o.method)}</td>
+      <td class="path">${esc(o.path)}</td><td class="summ">${esc(o.summary)} ${o.secured ? '<span class="lock">🔒</span>' : ""}</td></tr>`).join("")}`).join("")}</table>`;
+}
+
+function groupOps(ops) {
+  const groups = new Map();
+  for (const o of ops) {
+    const tag = o.tags?.[0] || (o.path.split("/").filter(Boolean)[0] ?? "/") ;
+    if (!groups.has(tag)) groups.set(tag, []);
+    groups.get(tag).push(o);
+  }
+  for (const list of groups.values())
+    list.sort((a, b) => a.path.localeCompare(b.path) || METHOD_ORDER.indexOf(a.method) - METHOD_ORDER.indexOf(b.method));
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+/**
+ * Renders the project form into `root`. `project` = null for a new project.
+ * onSaved(id) is called after a successful save.
+ */
+function renderProjectForm(root, project, onSaved) {
+  const isNew = !project;
+  const p = project || { name: "", description: "", spec: "", base_url: "", headers: "", headers_b: "", stages: null,
+    max_examples: 50, fail_on: "high", no_mutating_authz: false, exclude_paths: [], bola: [], operations: [] };
+  let ops = p.operations || [];
+  let chosenSpec = p.spec;
+
+  root.innerHTML = `<form class="form" autocomplete="off">
+    <section class="panel">
+      <h2 class="step"><span class="step-n">1</span> Find the APIs</h2>
+      <label class="field">Application URL, Swagger UI page, or Swagger/OpenAPI JSON URL
+        <div class="row"><input name="discover" placeholder="https://orders-staging.example.com" value="${esc(p.spec)}">
+        <button type="button" class="primary" data-act="discover">Discover</button></div></label>
+      <p class="hint">For an app root, apitest tries the usual locations: <code>/swagger/v1/swagger.json</code> (ASP.NET Core),
+        <code>/openapi/v1.json</code> (.NET 9), <code>/api-docs</code> (swagger-ui-express), <code>/openapi.json</code>, <code>/v3/api-docs</code>, and more.</p>
+      <div data-out="found"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="step"><span class="step-n">2</span> Project</h2>
+      <div class="grid2">
+        <label class="field">Name <input name="name" required value="${esc(p.name)}" placeholder="Orders API"></label>
+        <label class="field">Base URL <small>blank = from the spec</small>
+          <input name="base_url" value="${esc(p.base_url)}" placeholder="${esc(p.spec_info?.base_url || "https://orders-staging.example.com")}"></label>
+      </div>
+      <label class="field">Description <input name="description" value="${esc(p.description)}" placeholder="Optional"></label>
+      <label class="field">Spec URL <small>picked in step 1; you can also type it</small>
+        <input name="spec" required value="${esc(p.spec)}"></label>
+    </section>
+
+    <section class="panel">
+      <h2 class="step"><span class="step-n">3</span> Test users</h2>
+      <div class="grid2">
+        <label class="field">User A headers <small>one <code>Name: value</code> per line</small>
+          <textarea name="headers" rows="2" placeholder="Authorization: Bearer \${ORDERS_TOKEN_A}">${esc(p.headers)}</textarea></label>
+        <label class="field">User B headers <small>a second, ordinary user (BOLA tests)</small>
+          <textarea name="headers_b" rows="2" placeholder="Authorization: Bearer \${ORDERS_TOKEN_B}">${esc(p.headers_b)}</textarea></label>
+      </div>
+      <p class="hint">Write <code>\${ENV_VAR}</code> to reference an environment variable of the apitest server; those lines are saved with the project.
+        A literal token is kept in server memory only, so you re-enter it after a restart. Tokens are never written to disk.</p>
+      <details class="box"><summary>Cross-user (BOLA) scenarios <span class="count" data-out="bolaCount">${p.bola.length}</span></summary>
+        <p class="hint">Resources owned by <b>user A</b>. The tester checks A can access them, then replays the request as user B and flags any success.</p>
+        <div data-out="bola"></div><datalist id="opPaths"></datalist>
+        <button type="button" class="secondary small" data-act="addBola">+ Add scenario</button>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2 class="step"><span class="step-n">4</span> Tests</h2>
+      <div class="stages">${stageChecks(p.stages)}</div>
+      <details class="box"><summary>Advanced</summary>
+        <div class="grid2">
+          <label class="field">Fuzz examples per API <input name="max_examples" type="number" min="1" max="1000" value="${p.max_examples}"></label>
+          <label class="field">Fail threshold <select name="fail_on">${["critical", "high", "medium", "low"].map((s) => `<option ${s === p.fail_on ? "selected" : ""}>${s}</option>`).join("")}</select></label>
+        </div>
+        <label class="check"><input name="no_mutating_authz" type="checkbox" ${p.no_mutating_authz ? "checked" : ""}> Auth checks: only send GET / HEAD / OPTIONS</label>
+        <label class="field">Exclude paths <small>regex, one per line</small>
+          <textarea name="exclude_paths" rows="2" placeholder="^/internal/">${esc((p.exclude_paths || []).join("\n"))}</textarea></label>
+      </details>
+      <div class="warn">Run against <b>staging</b> only. Fuzzing and scans send thousands of requests, including POST/PUT/DELETE with junk data.</div>
+    </section>
+
+    <div class="actions">
+      <button type="submit" class="primary">${isNew ? "Create project" : "Save settings"}</button>
+      ${isNew ? `<button type="button" class="secondary" onclick="location.hash='#/'">Cancel</button>` : ""}
+    </div>
+    <p class="error" data-out="error" hidden></p>
+  </form>`;
+
+  const form = $("form", root);
+  const f = (n) => form.elements[n];
+  const bolaBox = $("[data-out=bola]", root);
+  const setOpPaths = () => {
+    $("#opPaths").innerHTML = [...new Set(ops.filter((o) => o.path_params.length).map((o) => o.path))].map((x) => `<option value="${esc(x)}">`).join("");
+  };
+  setOpPaths();
+  (p.bola || []).forEach((b) => bolaRow(bolaBox, ops, b));
+  $("[data-act=addBola]", root).addEventListener("click", () => {
+    bolaRow(bolaBox, ops);
+    $("[data-out=bolaCount]", root).textContent = $$(".bola-row", bolaBox).length;
+  });
+
+  async function doDiscover() {
+    const url = f("discover").value.trim();
+    if (!url) return;
+    const out = $("[data-out=found]", root);
+    out.innerHTML = `<p class="muted">Looking for Swagger/OpenAPI documents…</p>`;
+    try {
+      const res = await post("/api/discover", { url, headers: f("headers").value });
+      if (!res.specs.length) {
+        out.innerHTML = `<p class="error">No Swagger/OpenAPI document found (${res.tried} locations tried).</p>
+          <p class="hint">Check the app is running and reachable from this machine. If the spec lives somewhere unusual, paste its exact URL.
+          If the spec itself needs a token, fill in User A headers (step 3) first and discover again.</p>`;
+        return;
+      }
+      out.innerHTML = `<p class="hint">Found ${res.specs.length} document${res.specs.length > 1 ? "s" : ""}. Pick the one this project tests${res.specs.length > 1 ? " (create one project per document if you want to test several)" : ""}.</p>
+        <div class="found">${res.specs.map((s, i) => `
+          <label class="found-item"><input type="radio" name="pick" value="${i}" ${i === 0 ? "checked" : ""}>
+            <span><b>${esc(s.title || "Untitled API")}</b> ${esc(s.api_version)} · ${s.spec_version === "swagger2" ? "Swagger 2.0" : "OpenAPI 3"}${s.embedded ? " · embedded in Swagger UI page" : ""}</span>
+            <span><b>${s.operations}</b> APIs</span>
+            <span class="u">${esc(s.url)}${s.error ? ` <span class="error">${esc(s.error)}</span>` : ""}</span></label>`).join("")}</div>
+        <div class="preview" data-out="preview"></div>`;
+      const pick = (i) => {
+        const s = res.specs[i];
+        chosenSpec = s.url;
+        ops = s.ops || [];
+        f("spec").value = s.url;
+        if (!f("name").value && s.title) f("name").value = s.title;
+        f("base_url").placeholder = s.base_url || "Not in the spec: required";
+        $("[data-out=preview]", root).innerHTML = apiListPreview(ops);
+        setOpPaths();
+      };
+      $$("input[name=pick]", out).forEach((r) => r.addEventListener("change", () => pick(+r.value)));
+      pick(0);
+    } catch (e) {
+      out.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+    }
+  }
+  $("[data-act=discover]", root).addEventListener("click", doDiscover);
+  f("discover").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doDiscover(); } });
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("[data-out=error]", root);
+    err.hidden = true;
+    const body = {
+      name: f("name").value.trim(), description: f("description").value.trim(),
+      spec: f("spec").value.trim() || chosenSpec, base_url: f("base_url").value.trim(),
+      headers: f("headers").value, headers_b: f("headers_b").value,
+      stages: $$("input[name=stage]:checked", form).map((i) => i.value),
+      max_examples: parseInt(f("max_examples").value, 10) || 50, fail_on: f("fail_on").value,
+      no_mutating_authz: f("no_mutating_authz").checked,
+      exclude_paths: f("exclude_paths").value.split("\n").map((s) => s.trim()).filter(Boolean),
+      bola: readBola(bolaBox),
+    };
+    if (!body.spec) { err.textContent = "Pick or enter a spec URL (step 1)."; err.hidden = false; return; }
+    if (!body.stages.length) { err.textContent = "Select at least one test."; err.hidden = false; return; }
+    const btn = $("button[type=submit]", form);
+    btn.disabled = true;
+    try {
+      const id = isNew ? (await post("/api/projects", body)).id
+        : (await api(`/api/projects/${project.id}`, { method: "PUT", body: JSON.stringify(body) }), project.id);
+      onSaved(id);
+    } catch (ex) {
+      err.textContent = ex.message; err.hidden = false;
+    } finally { btn.disabled = false; }
+  });
+}
+
+function pageProjectForm() {
+  crumbs([["Projects", "#/"], ["New project"]]);
+  const view = $("#view");
+  view.innerHTML = `<div class="page-head"><div><h1>New project</h1>
+    <div class="meta">One project = one API application and its Swagger document.</div></div></div><div data-out="form"></div>`;
+  renderProjectForm($("[data-out=form]", view), null, (id) => { toast("Project created"); location.hash = `#/p/${id}`; });
+}
+
+/* ================= project page ================= */
+
+const reportCache = new Map();
+async function getReport(runId) {
+  if (!reportCache.has(runId)) reportCache.set(runId, api(`/api/runs/${runId}`).then((r) => r.report));
+  return reportCache.get(runId);
+}
+
+async function pageProject(pid, tab) {
+  const tok = pageToken;
+  const view = $("#view");
+  let p;
+  try { p = await api(`/api/projects/${pid}`); } catch (e) { view.innerHTML = `<p class="error">${esc(e.message)}</p>`; return; }
+  if (tok !== pageToken) return;
+  crumbs([["Projects", "#/"], [p.name]]);
+  const si = p.spec_info || {};
+  const selected = new Set(JSON.parse(sessionStorage.getItem(`sel.${pid}`) || "[]").filter((l) => p.operations.some((o) => o.label === l)));
+  const saveSel = () => sessionStorage.setItem(`sel.${pid}`, JSON.stringify([...selected]));
+
+  view.innerHTML = `
+    <div class="page-head">
+      <div><h1>${esc(p.name)}</h1>
+        <div class="meta">${p.description ? esc(p.description) + " · " : ""}${esc(si.title || "")} ${esc(si.api_version || "")} ·
+          ${si.version === "swagger2" ? "Swagger 2.0" : "OpenAPI 3"} · <b>${p.operations.length}</b> APIs</div>
+        <div class="meta">Spec <code>${esc(p.spec)}</code> → <code>${esc(p.base_url || si.base_url || "no base URL")}</code>
+          · API list refreshed ${esc(fmtAgo(p.refreshed))}</div></div>
+      <div class="toolbar">
+        <button class="secondary small" data-act="refresh" title="Reload the Swagger and update the API list">↻ Refresh APIs</button>
+        <button class="secondary small" data-act="yaml">Export CLI config</button>
+        <button class="danger small" data-act="delete">Delete</button>
+      </div>
+    </div>
+    <div class="runbar" data-out="runbar"></div>
+    <div class="tabs" role="tablist">
+      ${[["apis", `APIs <span class="count">${p.operations.length}</span>`], ["runs", "Runs"], ["settings", "Settings"]]
+        .map(([k, l]) => `<button class="tab ${tab === k ? "active" : ""}" onclick="location.hash='#/p/${esc(pid)}/${k}'">${l}</button>`).join("")}
+    </div>
+    <div data-out="tab"></div>`;
+
+  const runbar = $("[data-out=runbar]", view);
+  const startRun = async (operations) => {
+    try { const { id } = await post(`/api/projects/${pid}/runs`, { operations }); location.hash = `#/r/${id}`; }
+    catch (e) { toast(e.message, true); }
+  };
+  const renderRunbar = () => {
+    const stages = (p.stages || []).join(", ");
+    runbar.innerHTML = p.running
+      ? `<span class="live">Test running</span> <a href="#/r/${esc(p.running)}">Watch progress</a><span class="grow"></span>
+         <button class="stop" data-act="stop">■ Stop</button>`
+      : `<button class="primary" data-act="runAll">▶ Run all ${p.operations.length} APIs</button>
+         <button class="secondary" data-act="runSel" ${selected.size ? "" : "disabled"}>▶ Run selected (${selected.size})</button>
+         <span class="grow"></span><span class="meta">Tests: ${esc(stages)}</span>`;
+    $("[data-act=runAll]", runbar)?.addEventListener("click", () => startRun([]));
+    $("[data-act=runSel]", runbar)?.addEventListener("click", () => startRun([...selected]));
+    $("[data-act=stop]", runbar)?.addEventListener("click", () => stopRun(p.running).then(() => route()));
+  };
+  renderRunbar();
+
+  $("[data-act=refresh]", view).addEventListener("click", async () => {
+    try { const r = await post(`/api/projects/${pid}/refresh`); toast(`API list updated: ${r.operations} APIs`); route(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $("[data-act=yaml]", view).addEventListener("click", async () => {
+    const text = await api(`/api/projects/${pid}/yaml`);
+    dialog("CLI config", `<p class="hint">Save as <code>${esc(pid)}.yaml</code> and run <code>apitest run --config ${esc(pid)}.yaml</code>.
+      <code>\${VAR}</code> values are read from the environment; replace <code>&lt;set me&gt;</code> or pass tokens with <code>-H</code>.</p>
+      <textarea rows="18" readonly>${esc(text)}</textarea>`,
+      [{ label: "Copy", cls: "primary", onClick: () => navigator.clipboard.writeText(text) }, { label: "Close" }]);
+  });
+  $("[data-act=delete]", view).addEventListener("click", async () => {
+    if (await confirmDialog(`Delete “${p.name}”?`, `<p>This deletes the project and <b>all of its test runs</b> from disk. It doesn't touch the API itself.</p>`)) {
+      try { await api(`/api/projects/${pid}`, { method: "DELETE" }); toast("Project deleted"); location.hash = "#/"; }
+      catch (e) { toast(e.message, true); }
+    }
+  });
+
+  const tabBox = $("[data-out=tab]", view);
+  if (tab === "settings") {
+    renderProjectForm(tabBox, p, () => { toast("Settings saved"); route(); });
+  } else if (tab === "runs") {
+    renderRunsTab(tabBox, pid);
+  } else {
+    renderApisTab(tabBox, p, selected, () => { saveSel(); renderRunbar(); }, startRun);
+  }
+  if (p.running) {  // refresh the page state when the run finishes
+    timer = setTimeout(async function check() {
+      if (tok !== pageToken) return;
+      try {
+        const r = await api(`/api/runs/${p.running}`);
+        if (!["running", "stopping"].includes(r.status)) { reportCache.clear(); return route(); }
+      } catch { /* ignore */ }
+      timer = setTimeout(check, 3000);
+    }, 3000);
+  }
+}
+
+function renderApisTab(root, p, selected, onSelChange, startRun) {
+  const ops = p.operations;
+  if (!ops.length) {
+    root.innerHTML = `<div class="none">The spec has no operations. Use <b>Refresh APIs</b> after the app's Swagger is fixed.</div>`;
+    return;
+  }
+  root.innerHTML = `
+    <div class="api-filter">
+      <input type="search" placeholder="Filter by path, method, summary…" data-out="q">
+      <label class="check" style="margin:0"><input type="checkbox" data-out="onlyIssues"> Only APIs with issues</label>
+    </div>
+    <table class="apis"><thead><tr>
+      <th class="c"><input type="checkbox" data-act="all" title="Select all"></th><th style="width:76px">Method</th><th>Path</th>
+      <th class="res">Last result</th><th class="act"></th></tr></thead><tbody data-out="rows"></tbody></table>
+    <p class="hint">Last result = the newest run that tested that API. Click it to see its findings.</p>`;
+  const tbody = $("[data-out=rows]", root);
+  const q = $("[data-out=q]", root), onlyIssues = $("[data-out=onlyIssues]", root);
+
+  const resCell = (o) => {
+    const s = p.op_status[o.label];
+    if (!s) return `<span class="untested">not tested yet</span>`;
+    const n = Object.entries(s.counts).filter(([k]) => k !== "info").reduce((a, [, v]) => a + v, 0);
+    return n ? `<button class="res-btn ${s.max}" data-detail="${esc(o.label)}">${n} issue${n > 1 ? "s" : ""} · ${s.max}</button>`
+             : `<button class="res-btn clean" data-detail="${esc(o.label)}">✓ clean${s.partial ? "*" : ""}</button>`;
+  };
+
+  const render = () => {
+    const term = q.value.toLowerCase();
+    const shown = ops.filter((o) => (!term || `${o.method} ${o.path} ${o.summary} ${o.tags.join(" ")}`.toLowerCase().includes(term))
+      && (!onlyIssues.checked || Object.keys(p.op_status[o.label]?.counts || {}).some((k) => k !== "info")));
+    tbody.innerHTML = groupOps(shown).map(([tag, list]) => `
+      <tr class="group"><td class="c"><input type="checkbox" data-group="${esc(tag)}" ${list.every((o) => selected.has(o.label)) ? "checked" : ""}></td>
+        <td colspan="4">${esc(tag)} <span class="count">${list.length}</span></td></tr>
+      ${list.map((o) => `<tr class="op ${o.deprecated ? "deprecated" : ""}" data-label="${esc(o.label)}">
+        <td class="c"><input type="checkbox" data-op="${esc(o.label)}" ${selected.has(o.label) ? "checked" : ""}></td>
+        <td>${methodBadge(o.method)}</td>
+        <td><div class="path">${esc(o.path)} ${o.secured ? '<span class="lock" title="Spec says this needs auth">🔒</span>' : ""}</div>
+          ${o.summary ? `<div class="summ">${esc(o.summary)}</div>` : ""}</td>
+        <td class="res">${resCell(o)}</td>
+        <td class="act"><button class="secondary small" data-run1="${esc(o.label)}" ${p.running ? "disabled" : ""} title="Test only this API">▶ Run</button></td>
+      </tr>`).join("")}`).join("") || `<tr><td colspan="5" class="none">No APIs match.</td></tr>`;
+    $("[data-act=all]", root).checked = shown.length > 0 && shown.every((o) => selected.has(o.label));
+  };
+  render();
+  q.addEventListener("input", render);
+  onlyIssues.addEventListener("change", render);
+
+  root.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.dataset.op) { t.checked ? selected.add(t.dataset.op) : selected.delete(t.dataset.op); }
+    else if (t.dataset.group != null) {
+      const list = groupOps(ops).find(([g]) => g === t.dataset.group)?.[1] || [];
+      list.forEach((o) => (t.checked ? selected.add(o.label) : selected.delete(o.label)));
+    } else if (t.dataset.act === "all") {
+      $$("tr.op", tbody).forEach((tr) => (t.checked ? selected.add(tr.dataset.label) : selected.delete(tr.dataset.label)));
+    } else return;
+    onSelChange();
+    render();
+  });
+  root.addEventListener("click", async (e) => {
+    const run1 = e.target.closest("[data-run1]");
+    if (run1) return startRun([run1.dataset.run1]);
+    const det = e.target.closest("[data-detail]");
+    if (!det) return;
+    const label = det.dataset.detail;
+    const tr = det.closest("tr");
+    if (tr.nextElementSibling?.classList.contains("detail")) { tr.nextElementSibling.remove(); return; }
+    const s = p.op_status[label];
+    const detail = document.createElement("tr");
+    detail.className = "detail";
+    detail.innerHTML = `<td colspan="5"><p class="muted">Loading…</p></td>`;
+    tr.after(detail);
+    const rep = await getReport(s.run_id);
+    const list = rep.stages.flatMap((st) => st.findings.map((f) => ({ ...f, stage: st.name }))).filter((f) => f.operation === label);
+    $("td", detail).innerHTML = `<div class="meta" style="padding:8px 0">From run <a href="#/r/${esc(s.run_id)}">${esc(fmtTime(s.started))}</a>${s.partial ? " (stopped early: some tests didn't run)" : ""}</div>
+      ${findingsHtml(list) || `<div class="none">No findings for this API.</div>`}`;
+  });
+}
+
+async function renderRunsTab(root, pid) {
+  root.innerHTML = `<p class="muted">Loading…</p>`;
+  const runs = await api(`/api/projects/${pid}/runs`);
+  if (!runs.length) { root.innerHTML = `<div class="none">No runs yet. Use <b>Run all APIs</b> above.</div>`; return; }
+  root.innerHTML = `<table class="runs"><thead><tr><th>Started</th><th>Scope</th><th>Status</th><th>Findings</th><th>Duration</th></tr></thead><tbody>
+    ${runs.map((r) => `<tr data-run="${esc(r.id)}"><td>${esc(fmtTime(r.started))}</td>
+      <td>${r.operations?.length ? `${r.operations.length} selected API${r.operations.length > 1 ? "s" : ""}` : "All APIs"}</td>
+      <td><span class="status ${esc(r.status)}" style="font-size:11.5px;padding:1px 8px">${esc(r.status)}</span></td>
+      <td>${miniCounts(r.counts)}</td><td>${r.finished ? fmtDur(r.finished - r.started) : ""}</td></tr>`).join("")}</tbody></table>`;
+  $$("tr[data-run]", root).forEach((tr) => tr.addEventListener("click", () => (location.hash = `#/r/${tr.dataset.run}`)));
+}
+
+/* ================= run page ================= */
+
+function findingsHtml(list) {
+  return list.slice(0, 500).map((f) => `
+    <div class="finding"><details>
+      <summary><span class="sev ${f.severity}">${f.severity}</span>
+        <span>${esc(f.title)}<span class="stage-tag">${esc(f.stage)}</span></span>
+        <span class="where">${esc(f.endpoint)}</span></summary>
+      <pre>${esc(f.detail || "No further detail.")}</pre>
+    </details></div>`).join("") + (list.length > 500 ? `<div class="none">Showing 500 of ${list.length}. Narrow the filter.</div>` : "");
+}
+
+async function pageRun(runId) {
+  const tok = pageToken;
+  const view = $("#view");
+  const filter = { sev: null, stage: "all", op: "", q: "" };
+  let run;
+
+  // Layout is built once; while the run is live only meta/toolbar/progress are updated in place,
+  // so the Stop button isn't replaced under the user's cursor every poll.
+  let shownStatus = null;
+  const draw = () => {
+    if (!$("[data-out=progress]", view)) {
+      const proj = run.project_id ? [[run.project_name || run.project_id, `#/p/${run.project_id}`]] : [];
+      crumbs([["Projects", "#/"], ...proj, [`Run ${fmtTime(run.started)}`]]);
+      view.innerHTML = `
+        <div class="page-head">
+          <div><h1>${esc(run.project_name || "Test run")}</h1><div class="meta" data-out="meta"></div></div>
+          <div class="toolbar" data-out="toolbar"></div>
+        </div>
+        <ol class="progress" data-out="progress"></ol>
+        <div data-out="results"></div>`;
+    }
+    const live = ["running", "stopping"].includes(run.status);
+    const si = run.spec_info;
+    const elapsed = (run.finished || Date.now() / 1000) - run.started;
+    $("[data-out=meta]", view).innerHTML = `${run.operations?.length ? `<b>${run.operations.length}</b> selected API${run.operations.length > 1 ? "s" : ""}` : "All APIs"}
+      · started ${esc(fmtTime(run.started))} · ${fmtDur(elapsed)}${si ? ` · ${si.operations} APIs tested → <code>${esc(si.base_url)}</code>` : ""}
+      ${run.error ? `<div class="error">${esc(run.error)}</div>` : ""}`;
+    if (shownStatus !== run.status) {
+      shownStatus = run.status;
+      $("[data-out=toolbar]", view).innerHTML = `<span class="status ${esc(run.status)}">${run.status === "stopping" ? "stopping…" : esc(run.status)}</span>
+        ${run.status === "running" ? `<button class="stop" data-act="stop">■ Stop</button>` : ""}
+        ${!live && run.project_id ? `<button class="secondary small" data-act="rerun">↻ Run again</button>` : ""}`;
+      $("[data-act=stop]", view)?.addEventListener("click", async (e) => { e.target.disabled = true; await stopRun(runId); poll(); });
+      $("[data-act=rerun]", view)?.addEventListener("click", async () => {
+        try { const { id } = await post(`/api/projects/${run.project_id}/runs`, { operations: run.operations || [] }); location.hash = `#/r/${id}`; }
+        catch (e) { toast(e.message, true); }
+      });
+    }
+    $("[data-out=progress]", view).innerHTML = run.stages_requested.map((s) => {
+        const st = run.stages[s] || { status: "pending" };
+        const label = st.status === "running" ? "running…" : st.status === "pending" ? (run.status === "stopping" ? "will not run" : "waiting")
+          : `${st.status}${st.findings != null && st.status !== "cancelled" ? ` · ${st.findings} finding${st.findings === 1 ? "" : "s"}` : ""}`;
+        const dur = st.status === "running" && st.started ? Date.now() / 1000 - st.started : st.duration;
+        return `<li class="${esc(st.status)}"><div class="name">${s}<small>${fmtDur(dur)}</small></div>
+          <div class="st">${esc(label)}</div>${st.note ? `<div class="note">${esc(String(st.note).slice(0, 220))}</div>` : ""}</li>`;
+      }).join("");
+    if (run.report) drawResults();
+    else if (live) $("[data-out=results]", view).innerHTML = `<p class="muted">Results appear here when the run finishes. You can leave this page; the test keeps running.</p>`;
+  };
+
+  const all = () => run.report.stages.flatMap((s) => s.findings.map((f) => ({ ...f, stage: s.name })));
+
+  const drawResults = () => {
+    const box = $("[data-out=results]", view);
+    const list = all();
+    const counts = Object.fromEntries(SEVS.map((s) => [s, list.filter((f) => f.severity === s).length]));
+    const ops = [...new Set(list.map((f) => f.operation).filter(Boolean))].sort();
+    box.innerHTML = `
+      ${run.status === "cancelled" ? `<div class="warn" style="margin:0 0 12px">Stopped early. Results below are only from the tests that finished.</div>` : ""}
+      <div class="summary">${SEVS.map((s) => `<button class="pill ${s} ${counts[s] ? "" : "zero"} ${filter.sev === s ? "active" : ""}" data-sev="${s}"><b>${counts[s]}</b>${s}</button>`).join("")}</div>
+      <div class="filters">
+        <div class="tabs">${["all", ...run.report.stages.map((s) => s.name)].map((s) => {
+          const n = s === "all" ? list.length : list.filter((f) => f.stage === s).length;
+          return `<button class="tab ${filter.stage === s ? "active" : ""}" data-stage="${s}">${s} <span class="count">${n}</span></button>`;
+        }).join("")}</div>
+        <div class="right">
+          <select data-out="op"><option value="">All APIs</option><option value="-" ${filter.op === "-" ? "selected" : ""}>Not tied to one API</option>
+            ${ops.map((o) => `<option ${filter.op === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>
+          <input type="search" placeholder="Filter findings…" data-out="q" value="${esc(filter.q)}">
+        </div>
+      </div>
+      <div data-out="list"></div>
+      <div class="files">Raw output: ${run.files.map((f) => `<a href="/api/runs/${encodeURIComponent(run.id)}/files/${encodeURIComponent(f)}" target="_blank" rel="noopener">${esc(f)}</a>`).join(" ")}</div>`;
+    const drawList = () => {
+      const q = filter.q.toLowerCase();
+      const shown = list
+        .filter((f) => !filter.sev || f.severity === filter.sev)
+        .filter((f) => filter.stage === "all" || f.stage === filter.stage)
+        .filter((f) => !filter.op || (filter.op === "-" ? !f.operation : f.operation === filter.op))
+        .filter((f) => !q || `${f.title} ${f.endpoint} ${f.detail}`.toLowerCase().includes(q))
+        .sort((a, b) => SEVS.indexOf(a.severity) - SEVS.indexOf(b.severity));
+      $("[data-out=list]", box).innerHTML = shown.length ? findingsHtml(shown)
+        : `<div class="none">${list.length ? "No findings match the filter." : "No findings. 🎉"}</div>`;
+    };
+    drawList();
+    $$("[data-sev]", box).forEach((b) => b.addEventListener("click", () => { filter.sev = filter.sev === b.dataset.sev ? null : b.dataset.sev; drawResults(); }));
+    $$("[data-stage]", box).forEach((b) => b.addEventListener("click", () => { filter.stage = b.dataset.stage; drawResults(); }));
+    $("[data-out=op]", box).addEventListener("change", (e) => { filter.op = e.target.value; drawList(); });
+    $("[data-out=q]", box).addEventListener("input", (e) => { filter.q = e.target.value; drawList(); });
+  };
+
+  async function poll() {
+    try { run = await api(`/api/runs/${runId}`); }
+    catch (e) { view.innerHTML = `<p class="error">${esc(e.message)}</p>`; return; }
+    if (tok !== pageToken) return;
+    const live = ["running", "stopping"].includes(run.status);
+    // don't wipe an expanded finding or filter input on every poll once results exist
+    if (live || !view.dataset.final || view.dataset.final !== runId) draw();
+    if (live) { clearTimeout(timer); timer = setTimeout(poll, 1500); }
+    else { view.dataset.final = runId; reportCache.delete(runId); }
+  }
+  view.dataset.final = "";
+  view.innerHTML = `<p class="muted">Loading…</p>`;
+  poll();
+}
+
+/* ================= init ================= */
+
+(async function init() {
+  try { env = await api("/api/env"); } catch { /* keep defaults */ }
+  window.addEventListener("hashchange", route);
+  route();
+})();

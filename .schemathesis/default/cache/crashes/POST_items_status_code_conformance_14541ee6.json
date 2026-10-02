@@ -1,0 +1,94 @@
+{
+  "operation": "POST /items",
+  "method": "POST",
+  "path_template": "/items",
+  "fingerprint": "14541ee6",
+  "case_id": "7ZVqjt",
+  "code_sample": "curl -X POST -H 'Authorization: [Filtered]' -H 'Content-Type: application/json' -d $'\\x0c\ufffd`5l\ufffd\\x05\ufffdth[\ufffd^L5r\ufffdo\ufffd' http://localhost:8000/items\n\n\u26a0\ufe0f  Request body contains non-printable characters. Actual value: b'\\x0c\\xef\\xbf\\xbd`5l\\xef\\xbf\\xbd\\x05\\xef\\xbf\\xbdth[\\xef\\xbf\\xbd^L5r\\xef\\xbf\\xbdo\\xef\\xbf\\xbd'",
+  "sequence": [
+    {
+      "method": "POST",
+      "url": "http://localhost:8000/items",
+      "url_template": "http://localhost:8000/items",
+      "headers": {
+        "User-Agent": "schemathesis/4.29.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "Authorization": "[Filtered]",
+        "X-Schemathesis-TestCaseId": "7ZVqjt",
+        "Content-Type": "application/json",
+        "Content-Length": "20"
+      },
+      "response": {
+        "status_code": 400,
+        "headers": {
+          "date": "Fri, 02 Oct 2026 06:50:06 GMT",
+          "server": "uvicorn",
+          "content-length": "48",
+          "content-type": "application/json"
+        },
+        "body": "{\"detail\":\"There was an error parsing the body\"}"
+      },
+      "link": null,
+      "checks": [
+        {
+          "name": "status_code_conformance",
+          "status": "failure",
+          "message": "Undocumented HTTP status code\n\nReceived: 400\nDocumented: 200, 422"
+        }
+      ],
+      "meta": {
+        "generation": {
+          "time": 0.002850299992132932,
+          "mode": "negative"
+        },
+        "components": {
+          "BODY": "negative"
+        },
+        "phase": {
+          "name": "fuzzing",
+          "data": {
+            "type": "FuzzingPhaseData",
+            "description": "Invalid syntax: random bytes",
+            "location": null,
+            "parameter": null,
+            "parameter_location": "BODY",
+            "mutations": [
+              {
+                "path": [],
+                "parameter_location": "body",
+                "schema_pointer": "",
+                "channel": "schema",
+                "operator": "syntax_fuzzing",
+                "keywords": [],
+                "parameter": null,
+                "original_value": null,
+                "new_value": null
+              }
+            ]
+          }
+        },
+        "pool_draws": [],
+        "pool_misses": [],
+        "semantic_draws": [],
+        "dictionary_draws": [],
+        "constants_draws": [],
+        "raw_containers": {}
+      },
+      "path": "/items",
+      "path_parameters": {},
+      "query": {},
+      "case_headers": {
+        "Authorization": "[Filtered]"
+      },
+      "cookies": {},
+      "case_body": {
+        "encoding": "base64",
+        "value": "DKRgNWzwlwWvdGhbiV5MNXLzb7I="
+      },
+      "media_type": "application/json",
+      "parent_index": null
+    }
+  ]
+}

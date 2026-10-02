@@ -1,0 +1,17 @@
+# Config for the bundled demo API. Copy this file for a real project.
+spec: http://localhost:8000/openapi.json
+base_url: http://localhost:8000
+headers:            # user A
+  Authorization: Bearer token-a
+headers_b:          # user B (a different, ordinary user)
+  Authorization: Bearer token-b
+max_examples: 30
+fail_on: high
+out_dir: reports/demo
+exclude_paths: []
+# Resources owned by user A. The tester confirms A can read them, then
+# replays the request as user B and flags any 2xx.
+bola:
+  - method: GET
+    path: /users/{uid}/orders/{oid}
+    params: {uid: 1, oid: 10}

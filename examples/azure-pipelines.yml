@@ -1,0 +1,36 @@
+# Example Azure DevOps stage. Point SPEC_URL at your staging Swagger endpoint and
+# store the test-user tokens as secret pipeline variables (API_TOKEN_A / API_TOKEN_B).
+trigger: none
+schedules:
+  - cron: "0 2 * * *"
+    displayName: Nightly API tests
+    branches: { include: [main] }
+    always: true
+
+pool: { vmImage: ubuntu-latest }
+
+variables:
+  SPEC_URL: https://staging.example.com/swagger/v1/swagger.json
+
+steps:
+  - task: UsePythonVersion@0
+    inputs: { versionSpec: "3.12" }
+  - task: NodeTool@0
+    inputs: { versionSpec: "20.x" }
+  - script: pip install -e .
+    displayName: Install apitest
+  - script: >
+      apitest run "$(SPEC_URL)"
+      -H "Authorization: Bearer $(API_TOKEN_A)"
+      --header-b "Authorization: Bearer $(API_TOKEN_B)"
+      --out $(Build.ArtifactStagingDirectory)/apitest
+    displayName: Run API tests
+  - task: PublishTestResults@2
+    condition: always()
+    inputs:
+      testResultsFiles: $(Build.ArtifactStagingDirectory)/apitest/schemathesis-junit.xml
+  - task: PublishBuildArtifacts@1
+    condition: always()
+    inputs:
+      PathtoPublish: $(Build.ArtifactStagingDirectory)/apitest
+      ArtifactName: apitest-report

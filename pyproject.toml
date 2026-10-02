@@ -1,0 +1,15 @@
+[project]
+name = "apitest"
+version = "0.2.0"
+description = "Point it at a Swagger/OpenAPI URL: lint, conformance, wrong-type probing, authz and DAST in one run"
+requires-python = ">=3.10"
+dependencies = ["schemathesis>=4", "httpx", "pyyaml", "jinja2", "fastapi", "uvicorn"]
+
+[project.scripts]
+apitest = "apitest.cli:main"
+
+[tool.setuptools]
+packages = ["apitest", "apitest.stages", "apitest.web"]
+
+[tool.setuptools.package-data]
+"apitest.web" = ["static/*"]

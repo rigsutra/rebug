@@ -1,0 +1,109 @@
+{
+  "operation": "POST /items",
+  "method": "POST",
+  "path_template": "/items",
+  "fingerprint": "2fa6d699",
+  "case_id": "KNmnEM",
+  "code_sample": "curl -X POST -H 'Authorization: [Filtered]' -H 'Content-Type: application/json' -d '{\"\\ud993\\udf1e\\u0005\\u00b5\\u008d\\u00c8\": [\"\", null], \"\\u00af\\ud8f9\\udf9a?\\u00eeXd\\u00b0\": {\"\\u00b1\": 638203, \"\\u00ebAL\\u0089\\u00a4\\u00fd\\u0016\\ud8bb\\udf06'\"'\"'4\\r\\u00ff\\u00a5m\": -91514758, \"\\ud8cd\\udc79<\\udbad\\udc88\\u009f\\u008d\\u00ea\": \"\\u009a\\udb18\\udeec\"}, \"\": {}, \"FALSE\": [], \"\\ud900\\udc63\\f \": {\"\\uda9e\\udeeb\": {}}, \"id\": 0, \"price\": -7.029701916535146e+16, \"name\": \"m2\\u0004u\\uda32\\udfe6\\uda17\\udefa\\u0016\\u00fc\\u00a6\\u0095\\uda19\\udd0f\\ud978\\uddca<\\u008dh\"}' http://localhost:8000/items",
+  "sequence": [
+    {
+      "method": "POST",
+      "url": "http://localhost:8000/items",
+      "url_template": "http://localhost:8000/items",
+      "headers": {
+        "User-Agent": "schemathesis/4.29.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "Authorization": "[Filtered]",
+        "X-Schemathesis-TestCaseId": "KNmnEM",
+        "Content-Type": "application/json",
+        "Content-Length": "459"
+      },
+      "response": {
+        "status_code": 500,
+        "headers": {
+          "date": "Fri, 02 Oct 2026 06:50:06 GMT",
+          "server": "uvicorn",
+          "content-length": "21",
+          "content-type": "text/plain; charset=utf-8"
+        },
+        "body": "Internal Server Error"
+      },
+      "link": null,
+      "checks": [
+        {
+          "name": "status_code_conformance",
+          "status": "failure",
+          "message": "Undocumented HTTP status code\n\nReceived: 500\nDocumented: 200, 422"
+        }
+      ],
+      "meta": {
+        "generation": {
+          "time": 0.01205729998764582,
+          "mode": "positive"
+        },
+        "components": {
+          "BODY": "positive"
+        },
+        "phase": {
+          "name": "fuzzing",
+          "data": {
+            "type": "FuzzingPhaseData",
+            "description": "Positive test case",
+            "location": null,
+            "parameter": null,
+            "parameter_location": null,
+            "mutations": []
+          }
+        },
+        "pool_draws": [
+          {
+            "location": "body",
+            "parameter_name": "id",
+            "resource_name": "Item",
+            "resource_field": "id",
+            "source_operation": "POST /items",
+            "source_status": 200
+          }
+        ],
+        "pool_misses": [],
+        "semantic_draws": [],
+        "dictionary_draws": [],
+        "constants_draws": [],
+        "raw_containers": {}
+      },
+      "path": "/items",
+      "path_parameters": {},
+      "query": {},
+      "case_headers": {
+        "Authorization": "[Filtered]"
+      },
+      "cookies": {},
+      "case_body": {
+        "encoding": "json",
+        "value": {
+          "\ud993\udf1e\u0005\u00b5\u008d\u00c8": [
+            "",
+            null
+          ],
+          "\u00af\ud8f9\udf9a?\u00eeXd\u00b0": {
+            "\u00b1": 638203,
+            "\u00ebAL\u0089\u00a4\u00fd\u0016\ud8bb\udf06'4\r\u00ff\u00a5m": -91514758,
+            "\ud8cd\udc79<\udbad\udc88\u009f\u008d\u00ea": "\u009a\udb18\udeec"
+          },
+          "": {},
+          "FALSE": [],
+          "\ud900\udc63\f ": {
+            "\uda9e\udeeb": {}
+          },
+          "id": 0,
+          "price": -7.029701916535146e+16,
+          "name": "m2\u0004u\uda32\udfe6\uda17\udefa\u0016\u00fc\u00a6\u0095\uda19\udd0f\ud978\uddca<\u008dh"
+        }
+      },
+      "media_type": "application/json",
+      "parent_index": null
+    }
+  ]
+}
