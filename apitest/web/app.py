@@ -45,6 +45,8 @@ from ..stages.conformance import log_scenarios
 from ..testlog import TestLog, iter_entries, write_csv
 
 STATIC = Path(__file__).parent / "static"
+GUIDES = Path(__file__).parent / "guides"  # downloadable copies of docs/*.md (tests/test_web.py keeps them identical)
+GUIDE_FILES = {"SWAGGER_GUIDE.md", "AI_RULES_OPENAPI.md", "STAGES.md"}
 DATA = Path("reports").resolve()
 
 app = FastAPI(title="apitest", docs_url=None, redoc_url=None)
@@ -490,6 +492,13 @@ def index():
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():  # browsers ask for this path directly; an SVG is accepted by all current ones
     return FileResponse(STATIC / "favicon.svg", media_type="image/svg+xml")
+
+
+@app.get("/guides/{name}")
+def guide_download(name: str):
+    if name not in GUIDE_FILES:
+        raise HTTPException(404)
+    return FileResponse(GUIDES / name, media_type="text/markdown", filename=name)
 
 
 @app.get("/static/{name}")

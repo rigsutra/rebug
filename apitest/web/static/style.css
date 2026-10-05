@@ -32,6 +32,7 @@ small, .hint, .muted { color: var(--muted); font-weight: 400; }
 .brand { font-weight: 700; font-size: 16px; color: var(--text); }
 .brand:hover { text-decoration: none; }
 .brand span { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+.help-btn { margin-left: auto; }
 .crumbs { color: var(--muted); font-size: 13px; display: flex; gap: 6px; flex-wrap: wrap; }
 .crumbs a { color: var(--muted); } .crumbs b { color: var(--text); font-weight: 600; }
 .view { padding: 20px 24px 60px; max-width: 1400px; margin: 0 auto; }
@@ -272,3 +273,49 @@ dialog h3 { margin-top: 0; }
 dialog textarea { width: 100%; }
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 6px; font-weight: 600; z-index: 20; max-width: 80vw; }
 .toast.err { background: var(--high); color: #fff; }
+
+/* ---------- how-to-use guide ---------- */
+dialog.guide { width: min(860px, 94vw); max-height: 90vh; }
+dialog.guide[open] { display: flex; flex-direction: column; }
+dialog.guide #dialogBody { overflow-y: auto; padding-right: 6px; }
+.guide h4 { margin: 26px 0 6px; font-size: 15px; display: flex; align-items: center; gap: 10px; }
+.guide p { margin: 4px 0 10px; }
+.guide ul.tight { margin: 8px 0; padding-left: 20px; }
+.guide ul.tight li { margin: 3px 0; }
+.flow { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+.flow > i { align-self: center; color: var(--muted); font-style: normal; font-size: 18px; }
+.flow .node { flex: 1 1 130px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; font-size: 13px; }
+.flow .node b { display: block; }
+.flow .node small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+.flow.big .node { text-align: center; font-weight: 600; padding: 12px 8px; }
+.flow.big .node b { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
+  color: var(--accent-text); font-size: 12px; margin-right: 8px; }
+.flow.small .node { font-size: 12.5px; padding: 6px 9px; flex-basis: 100px; }
+.downloads { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+@media (max-width: 640px) { .downloads { grid-template-columns: 1fr; } }
+.dl { display: block; border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; background: var(--panel-2); color: var(--text); }
+.dl:hover, .dl:focus-visible { border-color: var(--accent); text-decoration: none; outline: none; }
+.dl b { display: block; }
+.dl span { display: block; color: var(--muted); font-size: 12.5px; margin: 2px 0 6px; }
+.dl u { color: var(--accent); font-weight: 600; font-size: 12.5px; text-decoration: none; }
+.match { display: grid; grid-template-columns: 130px auto 1fr auto 130px; align-items: center; gap: 8px; margin: 8px 0 12px; }
+.match .end { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 18px 8px; text-align: center; font-weight: 700; }
+.match > i { color: var(--accent); font-style: normal; font-size: 22px; }
+.match .mid { border: 1px dashed var(--accent); border-radius: 8px; padding: 8px 12px; }
+.match .mid span { display: block; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+.match .mid ul { margin: 0; padding-left: 18px; font-size: 13px; }
+@media (max-width: 640px) { .match { grid-template-columns: 1fr; } .match > i { justify-self: center; transform: rotate(90deg); } }
+.pipe { border-left: 3px solid var(--accent); margin: 10px 0 10px 11px; padding-left: 14px; display: grid; gap: 8px; }
+.stage { border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); padding: 0 12px; }
+.stage > summary { cursor: pointer; padding: 9px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; list-style: none; }
+.stage > summary::-webkit-details-marker { display: none; }
+.stage > summary::after { content: "▾"; margin-left: auto; color: var(--muted); }
+.stage[open] > summary::after { content: "▴"; }
+.stage .num { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--accent);
+  color: var(--accent-text); font-size: 11.5px; font-weight: 700; margin-left: -26px; outline: 4px solid var(--panel); }
+.stage > summary b { min-width: 92px; }
+.stage > summary em { color: var(--muted); font-style: normal; font-size: 13px; }
+.tag { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; background: var(--code); color: var(--muted); font-weight: 600; }
+.stage[open] { padding-bottom: 8px; }
+.stage ul { margin: 6px 0 4px; padding-left: 20px; }
+.stage li { margin: 2px 0; font-size: 13px; }

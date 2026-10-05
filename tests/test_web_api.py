@@ -1424,3 +1424,17 @@ def test_spec_url_with_surrounding_spaces_still_runs(client):
     pid = _create(client, spec="  http://fake.test/openapi.json  ")
     run = _wait(client, _start(client, pid, operations=["GET /a"]))
     assert run["status"] == "done", run["error"]
+
+
+def test_guide_downloads_match_docs_and_unknown_is_404():
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from apitest.web.app import GUIDE_FILES, app
+    c = TestClient(app)
+    docs = Path(__file__).resolve().parent.parent / "docs"
+    for name in GUIDE_FILES:
+        r = c.get(f"/guides/{name}")
+        assert r.status_code == 200 and "attachment" in r.headers["content-disposition"]
+        assert r.content == (docs / name).read_bytes(), f"apitest/web/guides/{name} is out of date: copy it from docs/"
+    assert c.get("/guides/README.md").status_code == 404
+    assert c.get("/guides/..%2Fapp.py").status_code == 404

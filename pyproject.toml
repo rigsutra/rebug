@@ -15,7 +15,7 @@ apitest = "apitest.cli:main"
 packages = ["apitest", "apitest.stages", "apitest.web"]
 
 [tool.setuptools.package-data]
-"apitest.web" = ["static/*"]
+"apitest.web" = ["static/*", "guides/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
