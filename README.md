@@ -72,6 +72,35 @@ self-contained file you can open offline or send to someone:
 The same per-API coverage is in `coverage.csv` / `coverage.json`, and each test-log entry has a
 plain-language `explanation`.
 
+**Automatic login** (Settings → Test users → *Log in automatically*). Instead of pasting a token that
+expires, give apitest the login API and it fetches tokens itself:
+
+1. **Login API URL** and method, and the **request body**, with the password written as a name:
+   `{"email": "qa@example.com", "password": "${QA_PASSWORD}"}`. Literal passwords are refused.
+   Right below, the **Secrets** box lists every `${…}` name used: type the value and press **Save**.
+   It's stored **encrypted with the project** (Fernet; `reports/secrets.json`) and never shown
+   again, and it's left out of exports, reports and logs. Deleting the project deletes its secrets.
+   The same works for API keys or tokens in pasted headers (`X-API-Key: ${INGRESS_KEY}`).
+2. **Pick the token**: paste one sample login response and click **Use as token** on the right field
+   (e.g. `data.accessToken`). The sample stays in your browser.
+3. **Send the token as**: Bearer token, a custom header (e.g. `X-API-Key`), or a cookie.
+4. **Token expires**: automatically from the JWT's `exp` (the usual case), from a response field
+   (e.g. `data.expiresIn`), or after a fixed number of minutes.
+5. **Test login** shows when the token expires and when apitest would renew it.
+
+During a run apitest logs in at the start and fetches a new token **30 seconds before the current one
+expires**: in its own tests, and inside Schemathesis (through a generated hooks file). ZAP can't renew
+mid-scan, so it gets a freshly fetched token right before it starts. Wrong credentials stop the run
+before anything is tested, with the login API's error message. User A and user B each have their own
+login. In a CLI config this is `login_a:` / `login_b:` (see `examples/demo-login.yaml`); the CLI has
+no secret store, so there `${NAME}` comes from environment variables.
+
+**The encryption key.** By default apitest creates `reports/.secret.key` on first use. Anyone who can
+read both that file and `secrets.json` can decrypt the secrets, so **on a shared server set
+`APITEST_SECRET_KEY`** (a long passphrase) in the server's environment instead, and keep it out of
+the data folder. If the key changes, saved secrets can't be decrypted and must be entered again.
+Back up the key together with `secrets.json`.
+
 **No token, no silent run.** If APIs in the run need login and no token is set for user A, the UI
 asks before starting (Open Settings / Run anyway). Tokens typed into Settings are forgotten when the
 apitest server restarts; use `${ENV_VAR}` references to keep them.
@@ -166,6 +195,8 @@ The tester checks that A gets 2xx, then replays as B and flags any 2xx.
   spec and why, ASP.NET Core and Express setup, checklist, finding → fix table).
 - [docs/AI_RULES_OPENAPI.md](docs/AI_RULES_OPENAPI.md): a short rules block to paste into
   `CLAUDE.md` / Copilot / Cursor instructions in each API repo.
+- [docs/STAGES.md](docs/STAGES.md): what each stage tests, every test case it sends, and what
+  counts as pass or fail.
 
 ## Getting good results from .NET / Express specs
 
@@ -175,6 +206,15 @@ The tester checks that A gets 2xx, then replays as B and flags any 2xx.
 - **Express (swagger-jsdoc etc.):** make sure `security:` is declared and that response schemas exist.
   A hand-written spec drifts quickly, which is exactly what `conformance` will report.
 - If the spec uses a relative server URL like `/api`, pass `--base-url`.
+
+## HTTPS certificates
+
+apitest trusts Python's certificate list **plus the Windows certificate store**, so it works on
+machines where an antivirus web shield (Norton, Avast...) or a company proxy re-signs HTTPS, or
+where servers use an internal CA that Windows trusts. Discovery, login, every test stage and
+Schemathesis all use the same list. Verification is never turned off: an expired or wrong
+certificate is still rejected. To trust one more CA (for example on Linux CI), export it as PEM and
+set `APITEST_CA_BUNDLE` to the file.
 
 ## Safety
 
