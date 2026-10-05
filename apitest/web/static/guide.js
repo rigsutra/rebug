@@ -48,6 +48,9 @@ const GUIDE_HTML = `<div class="guide">
 
   <h4><span class="step-n">3</span> What each stage tests</h4>
   <p>The stages run in this order. Click one for the details.</p>
+  <p class="hint">To run only some stages, untick the others in the <b>Tests</b> chips next to the Run buttons, e.g. only
+    <b>authz</b> for all APIs. This changes the next runs only; the project's defaults stay in Settings.
+    Each API's <b>Last result</b> keeps the newest result of every stage, even when they come from different runs.</p>
   <div class="pipe">
     <details class="stage"><summary><span class="num">1</span><b>lint</b><em>Is the Swagger well written?</em><span class="tag quiet">no requests</span></summary>
       <ul><li>Valid OpenAPI, no broken references or duplicate operationIds</li>

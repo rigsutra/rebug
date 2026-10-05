@@ -125,6 +125,7 @@ class DiscoverIn(BaseModel):
 class RunIn(BaseModel):
     operations: list[str] = Field(default_factory=list)  # empty = whole project
     force: bool = False  # start even though no token is set for APIs that need login
+    stages: list[str] | None = None  # None = the project's stages
 
 
 # ---------------- helpers ----------------
@@ -410,10 +411,17 @@ def _worker(run_id: str, cfg: Config) -> None:
     _cancels.pop(run_id, None)
 
 
-def _start(p: dict, operations: list[str], force: bool = False) -> str:
+def _start(p: dict, operations: list[str], force: bool = False, stages: list[str] | None = None) -> str:
     running = _running_run(p["id"])
     if running:
         raise HTTPException(409, f"A run is already in progress for this project ({running}). Stop it first.")
+    if stages is not None:
+        if any(s not in ALL_STAGES for s in stages):
+            raise HTTPException(400, "Unknown stage")
+        if not stages:
+            raise HTTPException(400, "Select at least one test.")
+        stages = [s for s in ALL_STAGES if s in stages]  # pipeline order, no duplicates
+    stages = stages or p.get("stages") or list(ALL_STAGES)
     variables = _variables(p["id"])
     try:
         headers = {k: expand_env(v, variables) for k, v in _parse_headers(_merged_headers(p, "headers")).items()}
@@ -433,7 +441,7 @@ def _start(p: dict, operations: list[str], force: bool = False) -> str:
             except LoginError as e:
                 raise HTTPException(400, f"Login failed, so nothing was tested. {e}")
             providers[key] = prov
-    if secured and not headers and "login_a" not in providers and not force:
+    if secured and not headers and "login_a" not in providers and not force and stages != ["lint"]:  # lint sends no requests
         raise HTTPException(428, json.dumps({
             "code": "NO_TOKEN",
             "message": f"No token is set for user A, but {len(secured)} of the {len(scope)} APIs in this run need login. "
@@ -455,7 +463,7 @@ def _start(p: dict, operations: list[str], force: bool = False) -> str:
     cancel = threading.Event()
     cfg = Config(
         spec=p["spec"], base_url=p.get("base_url", ""), headers=headers, headers_b=headers_b,
-        stages=p.get("stages") or list(ALL_STAGES), max_examples=p.get("max_examples", 50),
+        stages=stages, max_examples=p.get("max_examples", 50),
         fail_on=p.get("fail_on", "high"), out_dir=str(runs_dir() / run_id),
         no_mutating_authz=p.get("no_mutating_authz", False), exclude_paths=p.get("exclude_paths", []),
         bola=p.get("bola", []), operations=operations, cancel=cancel, title=p["name"], variables=variables,
@@ -634,6 +642,52 @@ def create_project(body: ProjectIn):
     return {"id": p["id"]}
 
 
+def _op_status(pid: str, p: dict) -> dict[str, dict]:
+    """Latest result per operation, merged per stage: each stage's result comes from the newest finished
+    run that completed that stage on that operation. A lint-only run therefore doesn't hide older authz
+    findings. Skipped, failed and stopped stages don't count, so an older real result shows through."""
+    labels = {o["label"] for o in p.get("operations", [])}
+    wanted = set(p.get("stages") or ALL_STAGES)
+    per: dict[str, dict[str, dict]] = {}  # label -> stage -> {run_id, started, partial, counts}
+    for meta in _project_runs(pid, limit=30):  # newest first
+        if meta["status"] not in ("done", "cancelled"):
+            continue
+        tested = [l for l in (meta.get("tested") or []) if l in labels]
+        if not tested:
+            continue
+        rep = _report(meta["id"])
+        if not rep:
+            continue
+        for st in rep["stages"]:
+            if st["status"] != "ok":
+                continue
+            fresh = {l for l in tested if st["name"] not in per.get(l, {})}
+            if not fresh:
+                continue
+            for l in fresh:
+                per.setdefault(l, {})[st["name"]] = {"run_id": meta["id"], "started": meta["started"],
+                                                      "partial": meta["status"] == "cancelled", "counts": {}}
+            for fd in st["findings"]:
+                if fd.get("operation") in fresh:
+                    c = per[fd["operation"]][st["name"]]["counts"]
+                    c[fd["severity"]] = c.get(fd["severity"], 0) + 1
+        if len(per) == len(labels) and all(wanted <= set(v) for v in per.values()):
+            break
+    out = {}
+    for l, by_stage in per.items():
+        newest = max(by_stage.values(), key=lambda r: (r["started"], r["run_id"]))
+        counts: dict[str, int] = {}
+        for r in by_stage.values():
+            for sev, n in r["counts"].items():
+                counts[sev] = counts.get(sev, 0) + n
+        out[l] = {"run_id": newest["run_id"], "started": newest["started"],
+                  "partial": any(r["partial"] for r in by_stage.values()) or not wanted <= set(by_stage),
+                  "counts": counts, "max": max(counts, key=sev_rank) if counts else None,
+                  "stages": {name: {k: by_stage[name][k] for k in ("run_id", "started", "counts")}
+                             for name in ALL_STAGES if name in by_stage}}
+    return out
+
+
 @app.get("/api/projects/{pid}")
 def get_project(pid: str):
     p = _read_project(pid)
@@ -644,35 +698,7 @@ def get_project(pid: str):
     excluded = _excluded(p)
     for o in p.get("operations", []):
         o["excluded"] = o["label"] in excluded
-    # latest result per operation, from the newest runs that tested it
-    op_status: dict[str, dict] = {}
-    labels = {o["label"] for o in p.get("operations", [])}
-    for meta in _project_runs(pid, limit=30):
-        if meta["status"] not in ("done", "cancelled"):
-            continue
-        tested = meta.get("tested") or []
-        pending = [l for l in tested if l in labels and l not in op_status]
-        if not pending:
-            continue
-        rep = _report(meta["id"])
-        if not rep:
-            continue
-        finished_stages = {s["name"] for s in rep["stages"] if s["status"] not in ("cancelled",)}
-        for l in pending:
-            op_status[l] = {"run_id": meta["id"], "started": meta["started"], "counts": {}, "max": None,
-                            "partial": meta["status"] == "cancelled"}
-        for st in rep["stages"]:
-            if st["name"] not in finished_stages:
-                continue
-            for fd in st["findings"]:
-                s = op_status.get(fd.get("operation"))
-                if s and s["run_id"] == meta["id"]:
-                    s["counts"][fd["severity"]] = s["counts"].get(fd["severity"], 0) + 1
-                    if s["max"] is None or sev_rank(fd["severity"]) > sev_rank(s["max"]):
-                        s["max"] = fd["severity"]
-        if len(op_status) == len(labels):
-            break
-    p["op_status"] = op_status
+    p["op_status"] = _op_status(pid, p)
     return p
 
 
@@ -717,12 +743,12 @@ def delete_project(pid: str):
 def project_runs(pid: str):
     _read_project(pid)
     return [{k: m.get(k) for k in ("id", "status", "started", "finished", "operations", "error")}
-            | {"counts": _counts(_report(m["id"]))} for m in _project_runs(pid)]
+            | {"stages": m.get("stages_requested") or [], "counts": _counts(_report(m["id"]))} for m in _project_runs(pid)]
 
 
 @app.post("/api/projects/{pid}/runs")
 def start_project_run(pid: str, body: RunIn):
-    return {"id": _start(_read_project(pid), body.operations, body.force)}
+    return {"id": _start(_read_project(pid), body.operations, body.force, body.stages)}
 
 
 @app.get("/api/projects/{pid}/yaml", response_class=PlainTextResponse)

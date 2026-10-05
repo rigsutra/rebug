@@ -718,7 +718,8 @@ def test_list_projects_with_last_run(client, data):
     assert ps[other]["last_run"]["status"] == "interrupted" and ps[other]["last_run"]["counts"] is None
     runs = client.get(f"/api/projects/{pid}/runs").json()
     assert [r["id"] for r in runs] == ["20240102-000000-bbbbbb", "20240101-000000-aaaaaa"]  # newest first
-    assert set(runs[0]) == {"id", "status", "started", "finished", "operations", "error", "counts"}
+    assert set(runs[0]) == {"id", "status", "started", "finished", "operations", "error", "stages", "counts"}
+    assert runs[0]["stages"] == ["authz"]
     assert runs[1]["counts"] == {"high": 2, "low": 1}
 
 
@@ -736,9 +737,13 @@ def test_op_status_comes_from_newest_finished_run_per_api(client, data):
     st = client.get(f"/api/projects/{pid}").json()["op_status"]
     assert st == {
         "GET /b": {"run_id": "20240102-000000-bbbbbb", "started": 1700000000.0, "partial": True,
-                   "counts": {"low": 1, "critical": 1}, "max": "critical"},
+                   "counts": {"low": 1, "critical": 1}, "max": "critical",
+                   "stages": {"authz": {"run_id": "20240102-000000-bbbbbb", "started": 1700000000.0,
+                                        "counts": {"low": 1, "critical": 1}}}},
         "GET /a": {"run_id": "20240101-000000-aaaaaa", "started": 1700000000.0, "partial": False,
-                   "counts": {"medium": 1, "low": 1}, "max": "medium"},
+                   "counts": {"medium": 1, "low": 1}, "max": "medium",
+                   "stages": {"authz": {"run_id": "20240101-000000-aaaaaa", "started": 1700000000.0,
+                                        "counts": {"medium": 1, "low": 1}}}},
     }
 
 
@@ -748,6 +753,50 @@ def test_op_status_with_clean_run_and_early_stop(client, data):
     _mkrun(data, "20240102-000000-bbbbbb", pid, tested=LABELS, stages=[_stage("authz")])
     st = client.get(f"/api/projects/{pid}").json()["op_status"]
     assert set(st) == set(LABELS) and all(s["max"] is None and s["counts"] == {} for s in st.values())
+
+
+def test_op_status_merges_stages_from_different_runs(client, data):
+    """A single-stage run updates that stage only; the other stages keep their newest earlier result."""
+    pid = _create(client, stages=["lint", "authz", "zap"])
+    _mkrun(data, "20240101-000000-aaaaaa", pid, tested=["GET /a"], started=1700000000.0,
+           stages=[_stage("lint", [("low", "GET /a")]), _stage("authz", [("high", "GET /a")]),
+                   _stage("zap", [("medium", "GET /a")])])
+    _mkrun(data, "20240102-000000-bbbbbb", pid, tested=["GET /a"], started=1700000100.0,
+           stages=[_stage("lint")])                                   # lint-only rerun: lint is now clean
+    _mkrun(data, "20240103-000000-cccccc", pid, tested=["GET /a"], started=1700000200.0,
+           stages=[_stage("zap", status="skipped")])                  # skipped zap doesn't replace the real one
+    a = client.get(f"/api/projects/{pid}").json()["op_status"]["GET /a"]
+    assert {k: v["run_id"] for k, v in a["stages"].items()} == {
+        "lint": "20240102-000000-bbbbbb", "authz": "20240101-000000-aaaaaa", "zap": "20240101-000000-aaaaaa"}
+    assert a["counts"] == {"high": 1, "medium": 1} and a["max"] == "high"
+    assert a["run_id"] == "20240102-000000-bbbbbb" and a["partial"] is False
+
+
+def test_op_status_partial_when_a_project_stage_never_ran(client, data):
+    pid = _create(client, stages=["lint", "authz"])
+    _mkrun(data, "20240101-000000-aaaaaa", pid, tested=["GET /a"], stages=[_stage("lint")])
+    a = client.get(f"/api/projects/{pid}").json()["op_status"]["GET /a"]
+    assert list(a["stages"]) == ["lint"] and a["partial"] is True and a["max"] is None
+
+
+def test_run_with_chosen_stages(client, pipe):
+    pid = _create(client, stages=["authz"])
+    rid = _start(client, pid, stages=["zap", "lint", "zap"])
+    _wait(client, rid)
+    assert pipe.cfgs[-1].stages == ["lint", "zap"]                    # pipeline order, no duplicates
+    assert client.get(f"/api/runs/{rid}").json()["stages_requested"] == ["lint", "zap"]
+    assert client.get(f"/api/projects/{pid}").json()["stages"] == ["authz"]  # project default unchanged
+    for bad, msg in (([], "at least one"), (["nope"], "Unknown stage")):
+        r = client.post(f"/api/projects/{pid}/runs", json={"stages": bad})
+        assert r.status_code == 400 and msg in r.text
+
+
+def test_lint_only_run_needs_no_token(client, pipe):
+    pid = _create(client, headers="")
+    assert client.post(f"/api/projects/{pid}/runs", json={"stages": ["authz"]}).status_code == 428
+    assert _wait(client, _start(client, pid, stages=["lint"]))["status"] == "done"
+    _wait(client, _start(client, pid, force=True))                     # without stages: the project's own
+    assert pipe.cfgs[-1].stages == ["authz"]
 
 
 def test_yaml_export(client, monkeypatch):

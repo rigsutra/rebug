@@ -143,9 +143,9 @@ function projectCard(p) {
 }
 
 /** Start a run; if the server says no token is set for APIs that need login, ask first. */
-async function startProjectRun(pid, operations, force = false) {
+async function startProjectRun(pid, operations, force = false, stages = null) {
   try {
-    const { id } = await post(`/api/projects/${pid}/runs`, { operations, force });
+    const { id } = await post(`/api/projects/${pid}/runs`, stages ? { operations, force, stages } : { operations, force });
     location.hash = `#/r/${id}`;
   } catch (e) {
     let info = null;
@@ -158,7 +158,7 @@ async function startProjectRun(pid, operations, force = false) {
       { label: "Cancel", value: null },
     ]);
     if (choice === "settings") location.hash = `#/p/${pid}/settings`;
-    else if (choice === "force") startProjectRun(pid, operations, true);
+    else if (choice === "force") startProjectRun(pid, operations, true, stages);
   }
 }
 
@@ -668,22 +668,55 @@ async function pageProject(pid, tab) {
     <div data-out="tab"></div>`;
 
   const runbar = $("[data-out=runbar]", view);
-  const startRun = async (operations) => {
-    await startProjectRun(pid, operations);
+  // Stages the run buttons use. Starts as the project's stages; changing it here affects only the runs
+  // started from this tab, not the project settings.
+  const projStages = env.stages.filter((s) => (p.stages?.length ? p.stages : env.stages).includes(s));
+  let runStages = null;
+  try { runStages = JSON.parse(sessionStorage.getItem(`stages.${pid}`) || "null"); } catch { /* default */ }
+  runStages = Array.isArray(runStages) ? env.stages.filter((s) => runStages.includes(s)) : [...projStages];
+  const isDefault = () => runStages.join() === projStages.join();
+  const saveStages = () => {
+    try {
+      if (isDefault()) sessionStorage.removeItem(`stages.${pid}`);
+      else sessionStorage.setItem(`stages.${pid}`, JSON.stringify(runStages));
+    } catch { /* storage unavailable: the choice lasts until the page is left */ }
   };
+  const startRun = async (operations) => {
+    if (!runStages.length) return toast("Pick at least one test stage.", true);
+    await startProjectRun(pid, operations, false, runStages);
+  };
+  const stageChips = () => `<div class="stage-pick" role="group" aria-label="Tests to run">
+      <span class="meta">Tests:</span>
+      ${env.stages.map((s) => {
+        const on = runStages.includes(s), off = env.available[s] === false;
+        return `<label class="chip ${on ? "on" : ""} ${off ? "unavail" : ""}"
+          title="${esc(STAGE_INFO[s] + (off ? `. Unavailable right now: ${env.reasons[s]}, so it will be reported as skipped.` : ""))}">
+          <input type="checkbox" data-stage="${s}" ${on ? "checked" : ""}>${on ? "✓ " : ""}${s}</label>`;
+      }).join("")}
+      ${isDefault() ? "" : `<button class="link small" data-act="resetStages" title="Use the stages from Settings: ${esc(projStages.join(", "))}">Reset</button>`}
+    </div>`;
   const renderRunbar = () => {
-    const stages = (p.stages || []).join(", ");
+    const n = runStages.length;
+    const what = n === env.stages.length ? "" : n === 1 ? ` (${runStages[0]} only)` : n ? ` (${n} tests)` : "";
     runbar.innerHTML = p.running
       ? `<span class="live">Test running</span> <a href="#/r/${esc(p.running)}">Watch progress</a><span class="grow"></span>
          <button class="stop" data-act="stop">■ Stop</button>`
-      : `<button class="primary" data-act="runAll" ${testable.length ? "" : "disabled"}>▶ Run all ${testable.length} API${testable.length === 1 ? "" : "s"}</button>
+      : `<button class="primary" data-act="runAll" ${testable.length && n ? "" : "disabled"}>▶ Run all ${testable.length} API${testable.length === 1 ? "" : "s"}${esc(what)}</button>
          ${nExcluded ? `<span class="meta">${nExcluded} excluded</span>` : ""}
-         <button class="secondary" data-act="runSel" ${selected.size ? "" : "disabled"}>▶ Run selected (${selected.size})</button>
-         <span class="grow"></span><span class="meta">Tests: ${esc(stages)}</span>`;
+         <button class="secondary" data-act="runSel" ${selected.size && n ? "" : "disabled"}>▶ Run selected (${selected.size})</button>
+         <span class="grow"></span>${stageChips()}`;
     $("[data-act=runAll]", runbar)?.addEventListener("click", () => startRun([]));
     $("[data-act=runSel]", runbar)?.addEventListener("click", () => startRun([...selected]));
     $("[data-act=stop]", runbar)?.addEventListener("click", () => stopRun(p.running).then(() => route()));
+    $("[data-act=resetStages]", runbar)?.addEventListener("click", () => { runStages = [...projStages]; saveStages(); renderRunbar(); });
   };
+  runbar.addEventListener("change", (e) => {
+    const st = e.target.dataset.stage;
+    if (!st) return;
+    runStages = env.stages.filter((s) => (s === st ? e.target.checked : runStages.includes(s)));
+    saveStages();
+    renderRunbar();
+  });
   renderRunbar();
 
   $("[data-act=refresh]", view).addEventListener("click", async () => {
@@ -738,16 +771,20 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
     <table class="apis"><thead><tr>
       <th class="c"><input type="checkbox" data-act="all" title="Select all"></th><th style="width:76px">Method</th><th>Path</th>
       <th class="res">Last result</th><th class="act"></th></tr></thead><tbody data-out="rows"></tbody></table>
-    <p class="hint">Last result = the newest run that tested that API. Click it to see its findings.</p>`;
+    <p class="hint">Last result = for each test stage, its newest result on that API (stages can come from different runs).
+      <b>*</b> = some of the project's stages haven't run on it yet, or a run was stopped early. Click a result to see its findings.</p>`;
   const tbody = $("[data-out=rows]", root);
   const q = $("[data-out=q]", root), onlyIssues = $("[data-out=onlyIssues]", root);
 
+  const notRun = (s) => (p.stages || []).filter((x) => !s.stages?.[x]);
   const resCell = (o) => {
     const s = p.op_status[o.label];
     if (!s) return `<span class="untested">not tested yet</span>`;
     const n = Object.entries(s.counts).filter(([k]) => k !== "info").reduce((a, [, v]) => a + v, 0);
-    return n ? `<button class="res-btn ${s.max}" data-detail="${esc(o.label)}">${n} issue${n > 1 ? "s" : ""} · ${s.max}</button>`
-             : `<button class="res-btn clean" data-detail="${esc(o.label)}">✓ clean${s.partial ? "*" : ""}</button>`;
+    const missing = notRun(s);
+    const title = `Tested by: ${Object.keys(s.stages || {}).join(", ")}${missing.length ? `. Not run yet: ${missing.join(", ")}` : ""}`;
+    return n ? `<button class="res-btn ${s.max}" data-detail="${esc(o.label)}" title="${esc(title)}">${n} issue${n > 1 ? "s" : ""} · ${s.max}${s.partial ? "*" : ""}</button>`
+             : `<button class="res-btn clean" data-detail="${esc(o.label)}" title="${esc(title)}">✓ clean${s.partial ? "*" : ""}</button>`;
   };
 
   const render = () => {
@@ -799,10 +836,15 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
     detail.className = "detail";
     detail.innerHTML = `<td colspan="5"><p class="muted">Loading…</p></td>`;
     tr.after(detail);
-    const rep = await getReport(s.run_id);
-    const list = rep.stages.flatMap((st) => st.findings.map((f) => ({ ...f, stage: st.name }))).filter((f) => f.operation === label);
-    $("td", detail).innerHTML = `<div class="meta" style="padding:8px 0">From run <a href="#/r/${esc(s.run_id)}">${esc(fmtTime(s.started))}</a>${s.partial ? " (stopped early: some tests didn't run)" : ""}
-      · <a href="#/r/${esc(s.run_id)}?${new URLSearchParams({ view: "log", op: label })}">See every test sent to this API →</a></div>
+    const bySt = Object.entries(s.stages || {});
+    const reps = new Map(await Promise.all([...new Set(bySt.map(([, r]) => r.run_id))].map(async (id) => [id, await getReport(id)])));
+    const list = bySt.flatMap(([stage, r]) => (reps.get(r.run_id).stages.find((st) => st.name === stage)?.findings || [])
+      .filter((f) => f.operation === label).map((f) => ({ ...f, stage })));
+    const missing = notRun(s);
+    $("td", detail).innerHTML = `<div class="meta stage-src" style="padding:8px 0">
+        ${bySt.map(([stage, r]) => `<span><b>${esc(stage)}</b> <a href="#/r/${esc(r.run_id)}">${esc(fmtTime(r.started))}</a></span>`).join("")}
+        ${missing.length ? `<span>Not run yet: ${esc(missing.join(", "))}</span>` : ""}
+        <a href="#/r/${esc(s.run_id)}?${new URLSearchParams({ view: "log", op: label })}">Every test sent in the newest run →</a></div>
       ${findingsHtml(list) || `<div class="none">No findings for this API.</div>`}`;
   });
 }
@@ -811,9 +853,10 @@ async function renderRunsTab(root, pid) {
   root.innerHTML = `<p class="muted">Loading…</p>`;
   const runs = await api(`/api/projects/${pid}/runs`);
   if (!runs.length) { root.innerHTML = `<div class="none">No runs yet. Use <b>Run all APIs</b> above.</div>`; return; }
-  root.innerHTML = `<table class="runs"><thead><tr><th>Started</th><th>Scope</th><th>Status</th><th>Findings</th><th>Duration</th></tr></thead><tbody>
+  root.innerHTML = `<table class="runs"><thead><tr><th>Started</th><th>Scope</th><th>Tests</th><th>Status</th><th>Findings</th><th>Duration</th></tr></thead><tbody>
     ${runs.map((r) => `<tr data-run="${esc(r.id)}"><td>${esc(fmtTime(r.started))}</td>
       <td>${r.operations?.length ? `${r.operations.length} selected API${r.operations.length > 1 ? "s" : ""}` : "All APIs"}</td>
+      <td class="meta">${esc((r.stages || []).join(", "))}</td>
       <td><span class="status ${esc(r.status)}" style="font-size:11.5px;padding:1px 8px">${esc(r.status)}</span></td>
       <td>${miniCounts(r.counts)}</td><td>${r.finished ? fmtDur(r.finished - r.started) : ""}</td></tr>`).join("")}</tbody></table>`;
   $$("tr[data-run]", root).forEach((tr) => tr.addEventListener("click", () => (location.hash = `#/r/${tr.dataset.run}`)));
