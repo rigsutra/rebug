@@ -12,8 +12,8 @@ from pathlib import Path
 from ..models import Finding, StageResult
 from ..proc import Tail, progress, run_cmd
 from ..tls import ca_bundle
-from ..explain import (PHASES, blocked_by_auth, describe_case, expected_for, explain_check, permission_detail,
-                       phase_label, server_said)
+from ..explain import (PHASES, blocked_by_auth, describe_case, expected_for, explain_check, failure_body,
+                       permission_detail, phase_label, server_said)
 from ..testlog import b64_or_text, log_of
 
 
@@ -25,9 +25,9 @@ def run(spec, cfg, out: Path) -> StageResult:
         return res
     junit = out / "schemathesis-junit.xml"
     events = out / "schemathesis-events.ndjson"
-    if cfg.spec.startswith("http") and not spec.from_page and not spec.filtered:
+    if cfg.spec.startswith("http") and not spec.from_page and not spec.filtered and not spec.modified:
         schema_arg = cfg.spec
-    else:  # local file, spec embedded in a Swagger UI page, or reduced to selected operations
+    else:  # local file, spec embedded in a Swagger UI page, reduced to selected operations, or with saved examples
         schema_arg = str(out / "spec.json")
         (out / "spec.json").write_text(spec.text, encoding="utf-8")
     cmd = [sys.executable, "-m", "schemathesis.cli", "run", schema_arg, "--url", base,
@@ -55,10 +55,11 @@ def run(spec, cfg, out: Path) -> StageResult:
     events.unlink(missing_ok=True)
     progress(cfg, "conformance", "Starting Schemathesis", total=len(spec.operations))
     live = _Live(cfg, len(spec.operations), Tail(events))
+    stats: dict = {}  # per API: refusal checks that "failed" only because the refusal came back as HTTP 200
     try:
         p = run_cmd(cmd, cancel=cfg.cancel, timeout=1800, env=env, on_tick=lambda _lines: live.tick())
     finally:  # also on Stop: log whatever Schemathesis finished
-        n = log_scenarios(cfg, events)
+        n = log_scenarios(cfg, events, stats)
         # the raw stream holds the real Authorization/API-key headers; the test log has them masked
         _remove(events)
         progress(cfg, "conformance", f"Logged {n} request(s) to the test log")
@@ -74,7 +75,33 @@ def run(spec, cfg, out: Path) -> StageResult:
         name = case.get("name", "")
         for el in case.findall("failure") + case.findall("error"):
             res.findings += _split_checks(name, (el.text or el.get("message") or "").strip())
+    res.findings = _error_200_findings(res.findings, stats)
     return res
+
+
+# Checks that expect a refusal. An API that refuses with HTTP 200 and an error body fails them although it
+# did refuse: that isn't "accepts invalid input" or "works without login", but one smaller problem.
+REFUSAL_CHECKS = {"negative_data_rejection": "schema violating request", "ignored_auth": "authentication",
+                  "missing_required_header": "missing header not rejected"}
+
+
+def _error_200_findings(findings: list[Finding], stats: dict) -> list[Finding]:
+    """Drop findings whose every failing case was a refusal sent as HTTP 200; add one finding per API for that."""
+    out = []
+    for f in findings:
+        st = stats.get(f.endpoint) or {}
+        check = next((c for c, t in REFUSAL_CHECKS.items() if t in _norm(f.title)), None)
+        if check and st.get(check, {}).get("error_200") and not st.get(check, {}).get("real"):
+            continue
+        out.append(f)
+    for op, st in stats.items():
+        n = sum(v.get("error_200", 0) for v in st.values())
+        if n:
+            ex = next((v["example"] for v in st.values() if v.get("example")), "")
+            out.append(Finding("conformance", "low", "Reports errors with HTTP 200 instead of 4xx", op,
+                               f"{n} request(s) that should have been refused got HTTP 200 with an error in the "
+                               f"body. Clients and monitoring read HTTP 200 as success. For example: {ex}"))
+    return out
 
 
 def _remove(path: Path) -> None:
@@ -125,13 +152,19 @@ def scenario_cases(body: dict):
         rq, rs = inter.get("request") or {}, inter.get("response") or {}
         status = rs.get("status_code")
         ck = checks.get(cid) or []
-        failures, failures_raw = [], []
+        resp_body = b64_or_text(rs.get("content"))
+        said_200 = failure_body(resp_body) if isinstance(status, int) and 200 <= status < 300 else ""
+        failures, failures_raw, refused_200, real = [], [], [], []
         for c in ck:
             if c.get("status") == "failure":
+                if said_200 and c.get("name") in REFUSAL_CHECKS:
+                    refused_200.append(c.get("name"))  # it did refuse, only with the wrong status code
+                    continue
+                if c.get("name") in REFUSAL_CHECKS:
+                    real.append(c.get("name"))
                 f = (c.get("failure_info") or {}).get("failure") or {}
                 failures.append(explain_check(c.get("name", ""), status, f))
                 failures_raw.append(f"{f.get('title') or c.get('name')}: {(f.get('message') or '').strip()}")
-        resp_body = b64_or_text(rs.get("content"))
         if failures and status and status >= 500 and server_said(resp_body):
             failures[0] = failures[0].split(" Server said:")[0] + f" Server said: {server_said(resp_body)}"
         sent = {k.lower() for k in (rq.get("headers") or {})}
@@ -150,8 +183,10 @@ def scenario_cases(body: dict):
             "response": {"status": status, "headers": rs.get("headers"), "body": resp_body,
                          "elapsed_ms": round(rs["elapsed"] * 1000, 1) if rs.get("elapsed") is not None else None}
                         if rs else None,
-            "checks": [{"name": c.get("name"), "status": c.get("status")} for c in ck],
+            "checks": [{"name": c.get("name"), "status": "refused_with_200" if c.get("name") in refused_200
+                        else c.get("status")} for c in ck],
             "failures": failures, "failures_raw": failures_raw,
+            "error_200": said_200, "refused_200": refused_200, "real_refusal_fails": real,
         }
 
 
@@ -213,8 +248,9 @@ class _Live:
                 progress(self.cfg, "conformance", text, op=label, done=self.done, total=self.total, level=level)
 
 
-def log_scenarios(cfg, events: Path) -> int:
-    """Write every request Schemathesis made (from its NDJSON event stream) to the test log."""
+def log_scenarios(cfg, events: Path, stats: dict | None = None) -> int:
+    """Write every request Schemathesis made (from its NDJSON event stream) to the test log.
+    stats, if given, collects per API the refusal checks that failed only because of an HTTP 200 error body."""
     tl = log_of(cfg)
     if tl is None or not events.is_file():
         return 0
@@ -229,6 +265,14 @@ def log_scenarios(cfg, events: Path) -> int:
             continue
         for c in scenario_cases(body):
             code = (c["response"] or {}).get("status")
+            if stats is not None and c["operation"]:
+                st = stats.setdefault(c["operation"], {})
+                for name in c["refused_200"]:
+                    x = st.setdefault(name, {"error_200": 0, "real": 0})
+                    x["error_200"] += 1
+                    x.setdefault("example", f'{c["scenario"]} → HTTP {code}, "{c["error_200"]}"')
+                for name in c["real_refusal_fails"]:
+                    st.setdefault(name, {"error_200": 0, "real": 0})["real"] += 1
             verdict = "fail" if c["failures"] else "pass"
             if c["failures"]:
                 explanation = " ".join(c["failures"])
@@ -243,6 +287,12 @@ def log_scenarios(cfg, events: Path) -> int:
             elif c["blocked"]:
                 # the checks "passed" only because the 401/403 is documented: nothing was really tested
                 explanation, verdict = c["blocked"], "error"
+            elif c["error_200"] and (c["mode"] == "negative" or c["refused_200"]):
+                explanation = f'Refused, but with HTTP {code} and an error body ("{c["error_200"]}") instead of a 4xx.'
+            elif c["error_200"]:
+                # a valid request "answered" 200 with an error: the API's logic wasn't really exercised
+                explanation, verdict = (f'Not really tested: HTTP {code}, but the body says the request failed '
+                                        f'("{c["error_200"]}").'), "error"
             elif c["mode"] == "negative":
                 explanation = f"Refused with HTTP {code}, as it should."
             else:
@@ -252,7 +302,8 @@ def log_scenarios(cfg, events: Path) -> int:
                    request=c["request"], response=c["response"],
                    details={"phase": c["phase"], "phase_meaning": PHASES.get(c["phase"], ("", ""))[1],
                             "generation_mode": c["mode"], "case_id": c["case_id"], "checks": c["checks"],
-                            "failures": c["failures"], "tool_messages": c["failures_raw"]})
+                            "failures": c["failures"], "tool_messages": c["failures_raw"],
+                            "error_200": c["error_200"]})
             n += 1
     return n
 

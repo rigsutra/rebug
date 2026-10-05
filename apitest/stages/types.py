@@ -24,7 +24,7 @@ from ..discover import client_for
 from ..models import Finding, StageResult
 from ..proc import check, progress
 from ..auth import current_headers
-from ..explain import server_said
+from ..explain import ACCESS_TEXT, failure_body, server_said
 from ..testlog import log_of
 from ..spec import resolve
 from .authz import _url
@@ -290,30 +290,41 @@ def run(spec, cfg, out: Path) -> StageResult:
                 if tl:
                     tl.add_error("types", "Valid baseline body", op.method.upper(), url, str(e), op.label)
                 continue
+            said_200 = failure_body(r.text) if 200 <= r.status_code < 300 else ""
+            ok_b = 200 <= r.status_code < 300 and not said_200
+            said = said_200 or server_said(r.text)
             if tl:
-                ok_b = 200 <= r.status_code < 300
-                tl.add_httpx("types", "Valid request first (every field the correct type)", r, operation=op.label,
+                own = op.label in (cfg.examples or {})
+                tl.add_httpx("types", "Valid request first (every field the correct type)"
+                             + (" — your saved example" if own else ""), r, operation=op.label,
                              expected="2xx: a valid body is accepted",
                              verdict="pass" if ok_b else "error",
                              explanation=f"Accepted with HTTP {r.status_code}; wrong-type checks start from this request."
                              if ok_b else
                              f"Even this valid request was refused (HTTP {r.status_code}"
-                             + (f": {server_said(r.text)}" if server_said(r.text) else "") + "), so the wrong-type "
+                             + (", but the body says it failed" if said_200 else "")
+                             + (f": {said}" if said else "") + "), so the wrong-type "
                              "checks for this API were not run: a refusal wouldn't prove anything. "
-                             + ("Set a valid token for user A." if r.status_code in (401, 403) else
-                                "Add a working `example` to this request body in the Swagger."))
-            if not 200 <= r.status_code < 300:
+                             + ("This is an access problem: set a valid token or API key for user A."
+                                if r.status_code in (401, 403) or ACCESS_TEXT.search(said or "") else
+                                "Fix the saved example for this API (APIs tab → ✎ Example)." if own else
+                                "Save a working request for this API (APIs tab → ✎ Example), or add a working "
+                                "`example` to this request body in the Swagger."),
+                             details={"example_source": "project" if own else "swagger", "error_200": said_200})
+            if not ok_b:
                 skipped += 1
-                progress(cfg, "types", f"Skipped: valid baseline body got HTTP {r.status_code}", op=op.label,
-                         done=i, total=len(candidates), level="warn")
+                progress(cfg, "types", f"Skipped: valid baseline body got HTTP {r.status_code}"
+                         + (f" ({said})" if said else ""), op=op.label, done=i, total=len(candidates), level="warn")
                 res.findings.append(Finding(
-                    "types", "info", f"Type probing skipped: valid baseline body got HTTP {r.status_code}",
+                    "types", "info", f"Type probing skipped: valid baseline body got HTTP {r.status_code}"
+                    + (" with an error body" if said_200 else ""),
                     op.label,
                     "Add a working `example` to this request body in the spec (real IDs that exist on "
                     f"staging), so probing can start from an accepted request.\n\nBaseline sent:\n"
                     f"{json.dumps(baseline, indent=2)[:1200]}\n\nResponse:\n{r.text[:400]}"))
                 continue
             probed += 1
+            err_200 = []  # wrong-type requests refused, but with HTTP 200 and an error body
             flist = list(fields(raw, schema, baseline))[: cfg.types_max_fields]
             for fi, (fpath, types, required) in enumerate(flist, 1):
                 progress(cfg, "types", f"Field {fi}/{len(flist)} `{path_str(fpath)}` ({'/'.join(sorted(types))}): "
@@ -332,10 +343,15 @@ def run(spec, cfg, out: Path) -> StageResult:
                                 tl.add_error("types", scenario, op.method.upper(), url, str(e), op.label)
                             continue
                         log.append(f"{op.label} {path_str(fpath)}={json.dumps(bad)} -> {rr.status_code}")
+                        said_200 = failure_body(rr.text) if 200 <= rr.status_code < 300 else ""
+                        if said_200:
+                            err_200.append(f"`{path_str(fpath)}` = {json.dumps(bad)}: HTTP {rr.status_code}, \"{said_200}\"")
                         if tl:
-                            ok = 400 <= rr.status_code < 500
+                            ok = 400 <= rr.status_code < 500 or bool(said_200)
                             fname = path_str(fpath)
-                            expl = (f"Refused with HTTP {rr.status_code}, as it should." if ok else
+                            expl = (f"Refused, but with HTTP {rr.status_code} and an error body (\"{said_200}\") "
+                                    "instead of a 4xx." if said_200 else
+                                    f"Refused with HTTP {rr.status_code}, as it should." if ok else
                                     f"The server crashed (HTTP {rr.status_code}) when `{fname}` was {json.dumps(bad)}."
                                     if rr.status_code >= 500 else
                                     f"Accepted `{fname}` = {json.dumps(bad)} ({label}) with HTTP {rr.status_code}, "
@@ -345,10 +361,10 @@ def run(spec, cfg, out: Path) -> StageResult:
                                          expected="4xx: the wrong type must be rejected",
                                          verdict="pass" if ok else "fail", explanation=expl,
                                          details={"field": path_str(fpath), "declared_type": sorted(types),
-                                                  "sent_value": bad, "required": required,
+                                                  "sent_value": bad, "required": required, "error_200": said_200,
                                                   "problem": "" if ok else ("server crashed (5xx)" if rr.status_code >= 500
                                                                            else "wrong type accepted")})
-                        if 200 <= rr.status_code < 300:
+                        if 200 <= rr.status_code < 300 and not said_200:
                             if bad is None:
                                 null_ok = True
                             else:
@@ -377,6 +393,11 @@ def run(spec, cfg, out: Path) -> StageResult:
                     progress(cfg, "types", f"`{name}` " + ("crashed on: " + ", ".join(crashed) if crashed
                              else "accepted: " + ", ".join(accepted)), op=op.label, done=i - 1,
                              total=len(candidates), level="bad")
+            if err_200:
+                res.findings.append(Finding(
+                    "types", "low", "Reports errors with HTTP 200 instead of 4xx", op.label,
+                    f"{len(err_200)} wrong-type request(s) were refused, but with HTTP 200 and an error in the body. "
+                    "Clients and monitoring read HTTP 200 as success. For example:\n" + "\n".join(err_200[:5])))
             progress(cfg, "types", f"Done: {len(flist)} field(s) probed", op=op.label, done=i,
                      total=len(candidates), level="ok")
     (out / "types.log").write_text("\n".join(log), encoding="utf-8")

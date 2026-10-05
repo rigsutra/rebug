@@ -729,15 +729,16 @@ def test_testlog_entries(monkeypatch, tmp_path):
     assert (crash["verdict"], crash["details"]["problem"]) == ("fail", "server crashed (5xx)")
     assert crash["explanation"] == "The server crashed (HTTP 500) when `a` was null."
     assert acc["details"] | {"sent_value": None} == {"field": "a", "declared_type": ["integer"], "sent_value": None,
-                                                     "required": False, "problem": "wrong type accepted"}
+                                                     "required": False, "problem": "wrong type accepted",
+                                                     "error_200": ""}
     assert all(p["expected"] == "4xx: the wrong type must be rejected" and p["operation"] == "POST /items"
                and p["response"]["status"] in (201, 422, 500) for p in probes)
     assert json.loads(acc["request"]["body"]) == {"a": "1"}
 
 
 @pytest.mark.parametrize("status, body, hint", [
-    (401, "", "Set a valid token for user A."), (403, '{"message": "missing scope"}', "missing scope"),
-    (400, '{"detail": "qty is required"}', "Add a working `example`")])
+    (401, "", "set a valid token or API key for user A"), (403, '{"message": "missing scope"}', "missing scope"),
+    (400, '{"detail": "qty is required"}', "Save a working request for this API (APIs tab → ✎ Example)")])
 def test_testlog_rejected_baseline_explanation(monkeypatch, tmp_path, status, body, hint):
     log = TestLog(tmp_path / "log.ndjson")
     run_stage(monkeypatch, tmp_path, lambda r: httpx.Response(status, text=body), [body_op(SCHEMA)],

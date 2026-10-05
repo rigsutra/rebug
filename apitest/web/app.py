@@ -25,6 +25,8 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from ..config import ALL_STAGES, ENV_REF, Config, expand_env, parse_header
@@ -41,6 +43,7 @@ from ..secretstore import SecretStore
 from ..secretstore import check_name as check_secret_name
 from ..auth import REFRESH_MARGIN, LoginConfig, LoginError, TokenProvider, jwt_claims, literal_secrets
 from .. import htmlreport, triage
+from ..explain import failure_body, server_said
 from ..stages.conformance import log_scenarios
 from ..testlog import TestLog, iter_entries, write_csv
 
@@ -121,6 +124,13 @@ class VarIn(BaseModel):
 class DiscoverIn(BaseModel):
     url: str
     headers: str = ""
+
+
+class ExampleIn(BaseModel):
+    op: str                                           # "POST /items"
+    body: Any = None                                  # JSON request body; None = keep the Swagger's
+    path: dict[str, str] = Field(default_factory=dict)
+    query: dict[str, str] = Field(default_factory=dict)
 
 
 class RunIn(BaseModel):
@@ -467,7 +477,7 @@ def _start(p: dict, operations: list[str], force: bool = False, stages: list[str
         stages=stages, max_examples=p.get("max_examples", 50),
         fail_on=p.get("fail_on", "high"), out_dir=str(runs_dir() / run_id),
         no_mutating_authz=p.get("no_mutating_authz", False), exclude_paths=p.get("exclude_paths", []),
-        lenient_spec=p.get("lenient_spec", False),
+        lenient_spec=p.get("lenient_spec", False), examples=_examples(p),
         bola=p.get("bola", []), operations=operations, cancel=cancel, title=p["name"], variables=variables,
         login_a=p.get("login_a"), login_b=p.get("login_b"),
         auth_a=providers.get("login_a"), auth_b=providers.get("login_b"),
@@ -718,6 +728,65 @@ def update_project(pid: str, body: ProjectIn):
     return {"ok": True}
 
 
+def _examples(p: dict) -> dict:
+    """Saved examples for APIs still in the spec."""
+    labels = {o["label"] for o in p.get("operations", [])}
+    return {k: v for k, v in (p.get("examples") or {}).items() if k in labels}
+
+
+def _last_baseline(pid: str, op: str) -> dict | None:
+    """What the newest run sent as the wrong-type stage's valid request for `op`, and what came back."""
+    for meta in _project_runs(pid, limit=30):
+        f = runs_dir() / meta["id"] / "test-log.ndjson"
+        for e in iter_entries(f):
+            if e["stage"] == "types" and e["operation"] == op and e["scenario"].startswith("Valid request first"):
+                rq, rs = e.get("request") or {}, e.get("response") or {}
+                try:
+                    body = json.loads(rq["body"]) if rq.get("body") else None
+                except ValueError:
+                    body = rq.get("body")
+                st = rs.get("status") or 0
+                return {"run_id": meta["id"], "started": meta["started"], "url": rq.get("url", ""), "body": body,
+                        "status": rs.get("status"), "accepted": e["verdict"] == "pass",
+                        "said": (failure_body(rs.get("body")) if 200 <= st < 300 else "") or server_said(rs.get("body"))}
+    return None
+
+
+@app.get("/api/projects/{pid}/example")
+def get_example(pid: str, op: str):
+    p = _read_project(pid)
+    if op not in {o["label"] for o in p.get("operations", [])}:
+        raise HTTPException(404, f"{op} is not in this project's spec")
+    return {"saved": (p.get("examples") or {}).get(op), "last": _last_baseline(pid, op)}
+
+
+@app.put("/api/projects/{pid}/example")
+def save_example(pid: str, body: ExampleIn):
+    p = _read_project(pid)
+    o = next((o for o in p.get("operations", []) if o["label"] == body.op), None)
+    if not o:
+        raise HTTPException(400, f"{body.op} is not in this project's spec. Refresh the API list.")
+    unknown = sorted(set(body.path) - set(o.get("path_params") or []))
+    if unknown:
+        raise HTTPException(400, f"{body.op} has no path parameter {', '.join(unknown)}")
+    if body.body is None and not body.path and not body.query:
+        raise HTTPException(400, "Nothing to save: give a request body or parameter values")
+    ex = {k: v for k, v in (("body", body.body), ("path", body.path), ("query", body.query)) if v not in (None, {})}
+    p.setdefault("examples", {})[body.op] = ex
+    p["updated"] = time.time()
+    _write_project(p)
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{pid}/example")
+def delete_example(pid: str, op: str):
+    p = _read_project(pid)
+    if (p.get("examples") or {}).pop(op, None) is None:
+        raise HTTPException(404, "No saved example for this API")
+    _write_project(p)
+    return {"ok": True}
+
+
 @app.post("/api/projects/{pid}/refresh")
 def refresh_project(pid: str):
     p = _read_project(pid)
@@ -769,7 +838,7 @@ def project_yaml(pid: str):
                  headers_b=hdrs("headers_b"), stages=p.get("stages", ALL_STAGES),
                  max_examples=p.get("max_examples", 50), fail_on=p.get("fail_on", "high"),
                  out_dir=f"reports/{pid}", no_mutating_authz=p.get("no_mutating_authz", False),
-                 lenient_spec=p.get("lenient_spec", False),
+                 lenient_spec=p.get("lenient_spec", False), examples=_examples(p),
                  exclude_paths=p.get("exclude_paths", []), bola=p.get("bola", []),
                  login_a=p.get("login_a"), login_b=p.get("login_b"))
     data = asdict(cfg)

@@ -37,7 +37,13 @@ CAUSES: dict[str, Cause] = {
         "body with a schema (Zod, express-openapi-validator) instead of coercing values."),
     "null_accepted": Cause(
         "Accepts null where the Swagger doesn't allow it", "medium",
-        "Reject null for these fields with 400, or mark them nullable in the Swagger if null is valid."),
+        "Reject null for these fields with 400, or mark them nullable in the Swagger if null is valid. "
+        "ASP.NET: enable SupportNonNullableReferenceTypes so the Swagger shows which fields may be null.",
+        spec=True),  # Swaggers often leave nullability out, so this is as likely a Swagger gap as a bug
+    "error_as_200": Cause(
+        "Reports errors with HTTP 200 instead of a 4xx", "low",
+        "Answer refused requests with a 4xx status (400 for invalid input, 401/403 for login and permissions) "
+        "together with the error body. Clients, retries and monitoring read HTTP 200 as success."),
     "auth_bypass": Cause(
         "Works without a valid login", "critical",
         "Require authentication on this API ([Authorize] in .NET, auth middleware in Express). If it really is "
@@ -126,6 +132,7 @@ TITLE_CAUSE = [
     ("crashed the server", "server_error"),
     ("accepted wrong types", "wrong_type_accepted"),
     ("accepted null", "null_accepted"),
+    ("reports errors with http 200", "error_as_200"),
     ("bola: user b accessed", "bola"),
     ("secured endpoint accepted", "auth_bypass"),
     ("without authentication", "auth_bypass"),
@@ -275,6 +282,12 @@ def summarize(entries_by_op: dict[str, list[dict]], lenient: bool = False) -> di
             t = triage_entry(e, lenient)
             if t:
                 fails.append((e, t))
+            elif (e.get("details") or {}).get("error_200") and e.get("verdict") in ("pass", "error"):
+                g = groups.setdefault("error_as_200", {"cause": "error_as_200", "title": CAUSES["error_as_200"].title,
+                                                       "severity": "low", "fix": CAUSES["error_as_200"].fix,
+                                                       "spec_issue": False, "apis": {}, "tests": 0})
+                g["tests"] += 1
+                g["apis"][op] = g["apis"].get(op, 0) + 1
         if not fails:
             continue
         worst = max((t["severity"] for _, t in fails), key=sev_rank)

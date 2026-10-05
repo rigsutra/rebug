@@ -172,9 +172,53 @@ def finding_title(title: str) -> str:
     return FINDING_TITLES.get(title.strip(), title)
 
 
+FAILED_STATUS = re.compile(r"^(fail|failed|failure|error|unsuccessful|invalid)$", re.I)
+SUCCESS_FLAGS = ("success", "succeeded", "issuccess", "issucceeded", "ok")
+
+
+def failure_body(body: str | None) -> str:
+    """For a 2xx response: if the JSON body says the request failed ({"status": "Failed", ...},
+    {"success": false, ...}), what it said; else "". Some APIs refuse requests with HTTP 200."""
+    if not body or not body.lstrip().startswith("{"):
+        return ""
+    try:
+        import json
+        doc = json.loads(body)
+    except ValueError:
+        return ""
+    if not isinstance(doc, dict):
+        return ""
+    low = {str(k).lower(): v for k, v in doc.items()}
+    failed = any(isinstance(low.get(k), str) and FAILED_STATUS.match(low[k].strip())
+                 for k in ("status", "result", "outcome"))
+    failed = failed or any(low.get(k) is False for k in SUCCESS_FLAGS)
+    if not failed:
+        return ""
+    for k in ("message", "errormessage", "error", "detail", "title", "logmessage"):
+        if isinstance(low.get(k), str) and low[k].strip():
+            return low[k].strip()[:200]
+    return "the response body says the request failed"
+
+
+# Refusals for access reasons that don't use 401/403 ("400 User is not authorized", "200 API key is required")
+ACCESS_TEXT = re.compile(r"not authori[sz]ed|unauthori[sz]ed|forbidden|access (is )?denied|permission|"
+                         r"api[ _-]?key|not allowed to|insufficient (scope|privileges)", re.I)
+
+
 def server_said(body: str | None) -> str:
     """Short 'what the server said' from an error body."""
     if not body:
         return ""
-    m = re.search(r'"(?:detail|message|error|title)"\s*:\s*"([^"]{3,200})"', body)
-    return m[1] if m else body.strip()[:160]
+    m = re.search(r'"(?:detail|message|error|title|errorMessage)"\s*:\s*"([^"]{3,200})"', body)
+    if m:
+        return m[1]
+    text = body.strip()
+    if text.startswith('"'):  # a bare JSON string, e.g. "API key is required"
+        try:
+            import json
+            v = json.loads(text)
+            if isinstance(v, str):
+                return v[:160]
+        except ValueError:
+            pass
+    return text[:160]

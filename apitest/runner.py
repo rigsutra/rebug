@@ -11,7 +11,7 @@ from .config import Config
 from .models import StageResult, sev_rank
 from .proc import Cancelled
 from .report import write_reports
-from .spec import METHODS, Spec, filter_operations, load_spec
+from .spec import METHODS, Spec, apply_examples, filter_operations, load_spec
 from .stages import authz, conformance, lint, types, zap
 from . import coverage, htmlreport, triage
 from .auth import current_headers, has_user, make_providers
@@ -57,6 +57,8 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
             raise ValueError("Exclude paths removed every operation; nothing to test")
         if len(keep) < len(spec.operations):
             spec = filter_operations(spec, keep)
+    if cfg.examples:
+        spec = apply_examples(spec, cfg.examples)
     base = cfg.base_url or spec.base_url
     emit({"type": "spec", "version": spec.version, "operations": len(spec.operations), "base_url": base,
           "labels": [o.label for o in spec.operations]})

@@ -40,6 +40,7 @@ class Spec:
     full_text: str = ""  # whole document, for lint
     filtered: bool = False
     from_page: bool = False  # resolved from a Swagger UI page rather than fetched directly
+    modified: bool = False  # saved examples were written into `text` (see apply_examples)
 
 
 def _load_text(source: str, headers: dict[str, str], timeout: float) -> tuple[str, dict | None, str, bool]:
@@ -83,6 +84,63 @@ def filter_operations(spec: "Spec", labels: list[str]) -> "Spec":
         raise ValueError(f"Operation(s) not in the spec: {', '.join(sorted(missing))}")
     return Spec(raw, spec.source, spec.version, spec.base_url, ops, json.dumps(raw),
                 spec.full_text or spec.text, True, spec.from_page)
+
+
+def apply_examples(spec: "Spec", examples: dict[str, dict]) -> "Spec":
+    """Write the project's saved working requests into the document the stages test: the JSON request body
+    example, and path/query parameter examples. The wrong-type stage starts from them and Schemathesis sends
+    them in its examples phase. Lint keeps judging the original document (full_text).
+    examples: {"POST /items": {"body": {...}, "path": {"id": "12"}, "query": {"page": "1"}}}"""
+    if not examples or not any(o.label in examples for o in spec.operations):
+        return spec
+    raw = json.loads(json.dumps(spec.raw))
+    swagger2 = spec.version == "swagger2"
+    ops = []
+    for o in spec.operations:
+        ex = examples.get(o.label)
+        if not ex:
+            ops.append(o)
+            continue
+        item = raw["paths"][o.path]
+        op_raw = item[o.method]
+        body = ex.get("body")
+        if body is not None and "requestBody" in op_raw:
+            rb = json.loads(json.dumps(_resolve(raw, op_raw["requestBody"]) or {}))
+            for mt, media in (rb.get("content") or {}).items():
+                if re.search(r"[/+]json\b", mt):
+                    media.pop("examples", None)
+                    media["example"] = body
+            op_raw["requestBody"] = rb
+        overrides = {("path", k): str(v) for k, v in (ex.get("path") or {}).items()}
+        overrides.update({("query", k): str(v) for k, v in (ex.get("query") or {}).items()})
+        own = [_resolve(raw, p) for p in op_raw.get("parameters", [])]
+        shared = [_resolve(raw, p) for p in _resolve(raw, item).get("parameters", [])]
+        params = []
+        for p in shared + own:  # an operation's own parameter replaces a shared one of the same name
+            params = [q for q in params if (q.get("in"), q.get("name")) != (p.get("in"), p.get("name"))] + [p]
+        new = []
+        for p in params:
+            p = json.loads(json.dumps(p))
+            key = (p.get("in"), p.get("name"))
+            if key in overrides:
+                p["x-example" if swagger2 else "example"] = overrides[key]
+                p.pop("examples", None)
+            if p.get("in") == "body" and body is not None:
+                p["schema"] = {"allOf": [p.get("schema") or {}], "example": body}
+                p["x-example"] = body
+            new.append(p)
+        for (where, name), v in overrides.items():  # a parameter the Swagger forgot to declare
+            if not any((p.get("in"), p.get("name")) == (where, name) for p in new):
+                new.append({"name": name, "in": where, "required": where == "path",
+                            **({"type": "string", "x-example": v} if swagger2 else
+                               {"schema": {"type": "string"}, "example": v})})
+        op_raw["parameters"] = new
+        ops.append(Operation(o.method, o.path, o.secured, o.has_body,
+                             {**o.path_params, **(ex.get("path") and {k: str(v) for k, v in ex["path"].items()} or {})},
+                             {**o.query_params, **(ex.get("query") and {k: str(v) for k, v in ex["query"].items()} or {})},
+                             op_raw, new))
+    return Spec(raw, spec.source, spec.version, spec.base_url, ops, json.dumps(raw), spec.full_text or spec.text,
+                spec.filtered, spec.from_page, True)
 
 
 def resolve(raw: dict, node):

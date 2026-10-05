@@ -1515,3 +1515,37 @@ def test_run_shows_access_issues_and_finding_fixes(client, data):
                               "reason": "Not tested: x"}]
     f = run["report"]["stages"][0]["findings"][0]
     assert f["cause"] == "other" and f["fix"]
+
+
+def test_saved_examples_round_trip_and_reach_the_run(client, pipe, data):
+    pid = _create(client)
+    url = f"/api/projects/{pid}/example"
+    assert client.get(url, params={"op": "GET /items/{id}"}).json() == {"saved": None, "last": None}
+    r = client.put(url, json={"op": "GET /items/{id}", "path": {"id": "42"}, "query": {"q": "x"}})
+    assert r.status_code == 200
+    assert client.get(url, params={"op": "GET /items/{id}"}).json()["saved"] == {"path": {"id": "42"}, "query": {"q": "x"}}
+    for bad, msg in (({"op": "GET /nope", "body": {}}, "not in this project"),
+                     ({"op": "GET /items/{id}", "path": {"zzz": "1"}}, "no path parameter zzz"),
+                     ({"op": "GET /a"}, "Nothing to save")):
+        r = client.put(url, json=bad)
+        assert r.status_code == 400 and msg in r.text
+    assert client.get(f"/api/projects/{pid}").json()["examples"] == {"GET /items/{id}": {"path": {"id": "42"},
+                                                                                        "query": {"q": "x"}}}
+    rid = _start(client, pid)
+    _wait(client, rid)
+    assert pipe.cfgs[-1].examples == {"GET /items/{id}": {"path": {"id": "42"}, "query": {"q": "x"}}}
+    assert yaml.safe_load(client.get(f"/api/projects/{pid}/yaml").text)["examples"]["GET /items/{id}"]["path"] == {"id": "42"}
+    assert client.delete(url, params={"op": "GET /items/{id}"}).status_code == 200
+    assert client.delete(url, params={"op": "GET /items/{id}"}).status_code == 404
+
+
+def test_example_shows_what_the_last_run_sent(client, data):
+    pid = _create(client)
+    _mkrun(data, "20240101-000000-aaaaaa", pid, tested=["GET /a"], stages=[_stage("types")],
+           entries=[dict(stage="types", scenario="Valid request first (every field the correct type)",
+                         operation="GET /a", verdict="error",
+                         request={"method": "GET", "url": "http://fake.test/a", "body": '{"site": "nope"}'},
+                         response={"status": 200, "body": '{"status": "Failed", "message": "Site not found"}'})])
+    last = client.get(f"/api/projects/{pid}/example", params={"op": "GET /a"}).json()["last"]
+    assert last["body"] == {"site": "nope"} and last["status"] == 200 and last["said"] == "Site not found"
+    assert last["accepted"] is False and last["run_id"] == "20240101-000000-aaaaaa"

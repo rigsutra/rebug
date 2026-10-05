@@ -803,10 +803,12 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
         <td class="c"><input type="checkbox" data-op="${esc(o.label)}" ${selected.has(o.label) ? "checked" : ""} ${o.excluded ? "disabled" : ""}></td>
         <td>${methodBadge(o.method)}</td>
         <td><div class="path">${esc(o.path)} ${o.secured ? '<span class="lock" title="Spec says this needs auth">🔒</span>' : ""}
-          ${o.excluded ? `<span class="tag-excluded" title="Matches Exclude paths in Settings; never tested">excluded</span>` : ""}</div>
+          ${o.excluded ? `<span class="tag-excluded" title="Matches Exclude paths in Settings; never tested">excluded</span>` : ""}
+          ${p.examples?.[o.label] ? `<span class="tag-example" title="Tests start from your saved working request">example</span>` : ""}</div>
           ${o.summary ? `<div class="summ">${esc(o.summary)}</div>` : ""}</td>
         <td class="res">${o.excluded && !p.op_status[o.label] ? `<span class="untested">excluded</span>` : resCell(o)}</td>
-        <td class="act"><button class="secondary small" data-run1="${esc(o.label)}" ${p.running || o.excluded ? "disabled" : ""}
+        <td class="act"><button class="icon" data-example="${esc(o.label)}" title="Working example: the request this API's tests start from">✎</button>
+          <button class="secondary small" data-run1="${esc(o.label)}" ${p.running || o.excluded ? "disabled" : ""}
           title="${o.excluded ? "Excluded in Settings" : "Test only this API"}">▶ Run</button></td>
       </tr>`).join("")}`).join("") || `<tr><td colspan="5" class="none">No APIs match.</td></tr>`;
     $("[data-act=all]", root).checked = allSel(shown);
@@ -830,6 +832,8 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
   root.addEventListener("click", async (e) => {
     const run1 = e.target.closest("[data-run1]");
     if (run1) return startRun([run1.dataset.run1]);
+    const exb = e.target.closest("[data-example]");
+    if (exb) return editExample(p, ops.find((o) => o.label === exb.dataset.example), () => route());
     const det = e.target.closest("[data-detail]");
     if (!det) return;
     const label = det.dataset.detail;
@@ -851,6 +855,58 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
         <a href="#/r/${esc(s.run_id)}?${new URLSearchParams({ view: "log", op: label })}">Every test sent in the newest run →</a></div>
       ${findingsHtml(list) || `<div class="none">No findings for this API.</div>`}`;
   });
+}
+
+/** The working request an API's tests start from (instead of the Swagger's example). */
+async function editExample(p, o, onChange, draft = null) {
+  let info;
+  try { info = await api(`/api/projects/${p.id}/example?${new URLSearchParams({ op: o.label })}`); }
+  catch (e) { return toast(e.message, true); }
+  const saved = info.saved, last = info.last;
+  const pretty = (v) => v == null ? "" : JSON.stringify(v, null, 2);
+  const start = draft || {
+    body: pretty(saved ? saved.body : last?.body),
+    path: pretty(saved?.path || (o.path_params.length ? Object.fromEntries(o.path_params.map((n) => [n, ""])) : null)),
+    query: pretty(saved?.query || null),
+  };
+  const lastHtml = last ? `<div class="${last.accepted ? "hint" : "warn"}">The last run (${esc(fmtTime(last.started))}) sent the body below
+      ${last.accepted ? `and the API <b>accepted</b> it (HTTP ${esc(last.status)}).` :
+        `and the API <b>refused</b> it: HTTP ${esc(last.status)}${last.said ? ` — “${esc(last.said)}”` : ""}. Fix the values and save.`}
+      <div class="muted" style="margin-top:4px"><code>${esc(last.url)}</code></div></div>` : "";
+  const html = `<p class="hint">The wrong-type tests start from this request, and the behaviour tests send it as an example.
+      Use values that really exist on the test environment (real IDs, a site name that exists). Your Swagger isn't changed.</p>
+    ${saved ? `<p class="hint"><b>Saved.</b> Runs use this instead of the Swagger's example.</p>` : lastHtml}
+    <label class="field">Request body (JSON)${o.has_body ? "" : " <small>this API has no body</small>"}
+      <textarea rows="12" data-x="body" spellcheck="false" placeholder='{"name": "…"}'>${esc(start.body)}</textarea></label>
+    <div class="grid2">
+      <label class="field">Path parameters (JSON) <textarea rows="3" data-x="path" spellcheck="false" placeholder='{"id": "123"}'>${esc(start.path)}</textarea></label>
+      <label class="field">Query parameters (JSON) <textarea rows="3" data-x="query" spellcheck="false" placeholder='{"siteId": "1"}'>${esc(start.query)}</textarea></label>
+    </div>`;
+  const read = () => Object.fromEntries(["body", "path", "query"].map((k) => [k, $(`#dialog [data-x=${k}]`).value]));
+  let typed = null;
+  const choice = await dialog(`Working example · ${o.label}`, html, [
+    { label: "Save", cls: "primary", value: "save", onClick: () => (typed = read()) },
+    ...(saved ? [{ label: "Remove", cls: "danger", value: "remove" }] : []),
+    { label: "Cancel", value: null },
+  ]);
+  if (choice === "remove") {
+    try { await api(`/api/projects/${p.id}/example?${new URLSearchParams({ op: o.label })}`, { method: "DELETE" }); toast("Example removed"); onChange(); }
+    catch (e) { toast(e.message, true); }
+    return;
+  }
+  if (choice !== "save") return;
+  const parse = (k, what) => {
+    const t = typed[k].trim();
+    if (!t) return k === "body" ? null : {};
+    const v = JSON.parse(t);
+    if (k !== "body" && (typeof v !== "object" || Array.isArray(v) || v === null)) throw new Error(`${what} must be a JSON object like {"id": "123"}`);
+    return k === "body" ? v : Object.fromEntries(Object.entries(v).filter(([, x]) => x !== "" && x != null).map(([n, x]) => [n, String(x)]));
+  };
+  let body;
+  try { body = { op: o.label, body: parse("body", "Request body"), path: parse("path", "Path parameters"), query: parse("query", "Query parameters") }; }
+  catch (e) { toast(`Not valid JSON: ${e.message}`, true); return editExample(p, o, onChange, typed); }
+  try { await api(`/api/projects/${p.id}/example`, { method: "PUT", body: JSON.stringify(body) }); toast("Example saved. The next run starts from it."); onChange(); }
+  catch (e) { toast(e.message, true); return editExample(p, o, onChange, typed); }
 }
 
 async function renderRunsTab(root, pid) {
