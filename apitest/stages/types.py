@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from pathlib import Path
 
 import httpx
 
+from ..discover import client_for
 from ..models import Finding, StageResult
 from ..proc import check, progress
+from ..auth import current_headers
 from ..explain import server_said
 from ..testlog import log_of
 from ..spec import resolve
@@ -103,15 +106,28 @@ def _json_type_ok(value, types: set[str]) -> bool:
     return False
 
 
-def _num_bounds(schema: dict, default: float) -> float:
-    lo = schema.get("minimum")
-    ex = schema.get("exclusiveMinimum")
-    if isinstance(ex, (int, float)) and not isinstance(ex, bool):
-        lo = ex + 1
-    elif ex is True and lo is not None:
-        lo = lo + 1
+def _bound(schema: dict, key: str, integer: bool):
+    """Tightest usable minimum/maximum, or None. Exclusive bounds (3.0 boolean form, 3.1 numeric form) step
+    1 inward; for integers a fractional bound rounds inward (ceil for a minimum, floor for a maximum)."""
+    lower = key == "minimum"
+    ex = schema.get("exclusiveM" + key[1:])
+    out = []
+    for b, excl in ((schema.get(key), ex is True), (ex, True)):
+        if not isinstance(b, (int, float)) or isinstance(b, bool):
+            continue
+        if integer and lower:
+            b = math.floor(b) + 1 if excl else math.ceil(b)
+        elif integer:
+            b = math.ceil(b) - 1 if excl else math.floor(b)
+        elif excl:
+            b = b + 1 if lower else b - 1
+        out.append(b)
+    return (max if lower else min)(out, default=None)
+
+
+def _num_bounds(schema: dict, default: float, integer: bool = False) -> float:
+    lo, hi = _bound(schema, "minimum", integer), _bound(schema, "maximum", integer)
     v = lo if lo is not None else default
-    hi = schema.get("maximum")
     if hi is not None and v > hi:
         v = hi
     return v
@@ -159,7 +175,7 @@ def sample(raw: dict, schema, depth: int = 0):
         n = max(s.get("minItems", 1), 1)
         return [sample(raw, s.get("items", {}), depth + 1) for _ in range(n)]
     if t == "integer":
-        return int(_num_bounds(s, 1))
+        return int(_num_bounds(s, 1, integer=True))
     if t == "number":
         return float(_num_bounds(s, 1.5))
     if t == "boolean":
@@ -251,7 +267,7 @@ def run(spec, cfg, out: Path) -> StageResult:
         res.note = "No POST/PUT/PATCH operations with a JSON body to probe"
         progress(cfg, "types", res.note)
         return res
-    with httpx.Client(timeout=cfg.timeout, follow_redirects=False) as c:
+    with client_for(base, timeout=cfg.timeout, follow_redirects=False) as c:
         for i, (op, schema, example) in enumerate(candidates, 1):
             baseline = example if example is not None else sample(raw, schema)
             if not isinstance(baseline, (dict, list)):
@@ -263,7 +279,7 @@ def run(spec, cfg, out: Path) -> StageResult:
                 nonlocal sent
                 check(cfg)
                 sent += 1
-                return c.request(op.method.upper(), url, headers=cfg.headers,
+                return c.request(op.method.upper(), url, headers=current_headers(cfg),
                                  params=op.query_params, json=body)
 
             tl = log_of(cfg)

@@ -42,16 +42,20 @@ class Tail:
     def __init__(self, path: Path):
         self.path, self.pos, self.buf = Path(path), 0, b""
 
-    def lines(self) -> list[str]:
+    def lines(self, final: bool = False) -> list[str]:
+        """`final`: the writer has exited, so a last line without a newline is complete too."""
         try:
             with open(self.path, "rb") as f:
                 f.seek(self.pos)
                 data = f.read()
                 self.pos = f.tell()
         except OSError:
-            return []
+            data = b""
         self.buf += data
         *complete, self.buf = self.buf.split(b"\n")
+        if final and self.buf:
+            complete.append(self.buf)
+            self.buf = b""
         return [c.decode("utf-8", "replace").rstrip("\r") for c in complete]
 
 
@@ -106,7 +110,7 @@ def run_cmd(cmd: list[str], *, cancel: threading.Event | None = None, timeout: f
                     on_tick(tail.lines() + tail_err.lines())
                 time.sleep(0.25)
             if on_tick:
-                on_tick(tail.lines() + tail_err.lines())
+                on_tick(tail.lines(final=True) + tail_err.lines(final=True))
         return Result(p.returncode, out_path.read_bytes().decode("utf-8", "replace"),
                       err_path.read_bytes().decode("utf-8", "replace"))
     finally:

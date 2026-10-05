@@ -62,7 +62,9 @@ def build(run_dir: Path, meta: dict, coverage: dict) -> Path:
         "stage_info": {k: list(v) for k, v in STAGES.items()},
         "phase_info": {k: list(v) for k, v in PHASES.items() if k != "probing"},
     }
-    blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    # every "<" escaped (only possible inside JSON strings): "</script>", "<!--" or "<script" from the target
+    # API can then neither close the data block nor switch the HTML parser into a state that never ends it
+    blob = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c")
     title = html.escape(f"API test report — {data['run']['project'] or 'apitest'}")
     out = run_dir / "test-report.html"
     out.write_text(TEMPLATE.replace("__TITLE__", title).replace("__DATA__", blob), encoding="utf-8")

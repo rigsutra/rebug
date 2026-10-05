@@ -20,9 +20,21 @@ SPEC = {
 }
 
 
+LOGINS = []
+
+
 def fake_handler(request: httpx.Request) -> httpx.Response:
     if request.url.path == "/openapi.json":
         return httpx.Response(200, json=SPEC)
+    if request.url.path == "/auth/login":
+        import base64, json as _j
+        body = _j.loads(request.content)
+        if body.get("password") != "pw-from-env":
+            return httpx.Response(401, json={"message": "Invalid email or password"})
+        LOGINS.append(body["email"])
+        b = lambda d: base64.urlsafe_b64encode(_j.dumps(d).encode()).decode().rstrip("=")
+        tok = f"{b({'alg': 'none'})}.{b({'sub': body['email'], 'exp': int(time.time()) + 900})}.sig"
+        return httpx.Response(200, json={"success": True, "data": {"accessToken": tok}})
     if request.url.path.startswith("/slow"):
         time.sleep(0.3)
     return httpx.Response(200, json={}, headers={"x-content-type-options": "nosniff"})
@@ -31,6 +43,13 @@ def fake_handler(request: httpx.Request) -> httpx.Response:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     real = httpx.Client
+    real_request = httpx.request
+
+    def fake_request(method, url, **kw):  # the login call uses httpx.request
+        with real(transport=httpx.MockTransport(fake_handler)) as c:
+            kw.pop("follow_redirects", None)
+            return c.request(method, url, **kw)
+    monkeypatch.setattr(httpx, "request", fake_request)
     def fake_client(*a, **kw):
         kw["transport"] = httpx.MockTransport(fake_handler)
         return real(*a, **kw)
@@ -137,6 +156,40 @@ def test_test_log_browse_filter_and_download(client, monkeypatch):
     public = [json.loads(l) for l in client.get(f"/api/runs/{rid}/download/ndjson").text.splitlines()
               if '"GET /a"' in l]
     assert public[0]["request"]["headers"]["authorization"] == "Bearer ***"
+
+
+LOGIN = {"url": "http://fake.test/auth/login", "body": '{"email": "qa@x.test", "password": "${APITEST_PW}"}',
+         "token_path": "data.accessToken"}
+
+
+def test_automatic_login(client, monkeypatch, tmp_path):
+    import json as _j
+    LOGINS.clear()
+    monkeypatch.setenv("APITEST_PW", "pw-from-env")
+    # a literal password is refused, with a message saying how to do it instead
+    bad = {**LOGIN, "body": '{"email": "qa@x.test", "password": "hunter2"}'}
+    r = client.post("/api/projects", json={"name": "L", "spec": "http://fake.test/openapi.json", "login_a": bad})
+    assert r.status_code == 400 and "typed directly" in r.text and "${NTT_PASSWORD}" in r.text
+    # Test login: works, never returns the token
+    t = client.post("/api/login/test", json={"login": LOGIN}).json()
+    assert t["ok"] and t["expiry_source"] == "JWT exp claim" and t["token_preview"].endswith("…")
+    assert len(t["token_preview"]) < 12
+    # project with login: no NO_TOKEN prompt, run logs in by itself, /b gets the bearer token
+    pid = client.post("/api/projects", json={"name": "L", "spec": "http://fake.test/openapi.json",
+                                             "stages": ["authz"], "login_a": LOGIN}).json()["id"]
+    saved = (tmp_path / "projects" / f"{pid}.json").read_text()
+    assert "pw-from-env" not in saved and "${APITEST_PW}" in saved
+    run = _wait(client, client.post(f"/api/projects/{pid}/runs", json={}).json()["id"])
+    assert run["status"] == "done" and LOGINS  # logged in
+    assert any(f["stage"] == "auth" and "Logged in as user A" in f["msg"] for f in run["feed"])
+    pub = [e for e in client.get(f"/api/runs/{pid and run['id']}/log", params={"op": "GET /a"}).json()["items"]]
+    assert pub
+    full = client.get(f"/api/runs/{run['id']}/log/{pub[0]['seq']}").json()
+    assert full["request"]["headers"]["authorization"] == "Bearer ***"
+    # wrong password: the run doesn't start, the error says why
+    monkeypatch.setenv("APITEST_PW", "wrong")
+    r = client.post(f"/api/projects/{pid}/runs", json={})
+    assert r.status_code == 400 and "Invalid email or password" in r.text and "nothing was tested" in r.text
 
 
 def test_missing_env_var_is_a_clear_error(client, monkeypatch):

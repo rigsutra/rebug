@@ -14,6 +14,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }  /* classes like .field set display and would override `hidden` */
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -88,6 +89,26 @@ details.box[open] > summary { margin-bottom: 8px; }
 .bola-row .params { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; padding-left: 96px; }
 .bola-row .params label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); font-weight: 400; }
 .bola-row .params input { width: 140px; padding: 4px 6px; }
+
+/* ---------- test users ---------- */
+fieldset.user-auth { border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px 4px; margin: 0 0 12px; }
+fieldset.user-auth legend { font-weight: 700; padding: 0 6px; }
+fieldset.user-auth legend small { font-weight: 400; }
+.seg { display: flex; gap: 18px; margin: 4px 0 10px; flex-wrap: wrap; }
+.seg label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.grid-login { display: grid; grid-template-columns: 110px 1fr; gap: 10px; }
+table.pick { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+table.pick td { padding: 4px 6px; border-bottom: 1px solid var(--border); }
+table.pick td.act { text-align: right; white-space: nowrap; }
+.vars { margin: 4px 0 10px; }
+.vars h4 { margin: 8px 0 2px; font-size: 13px; }
+table.vars-t { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.vars-t td { padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+table.vars-t td.vs { font-size: 12.5px; white-space: nowrap; }
+table.vars-t input[type=password] { min-width: 180px; }
+.nowrap { white-space: nowrap; }
+.login-test { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin: 2px 0 6px; font-size: 13px; }
+.ok-text { color: var(--ok); font-weight: 600; }
 
 /* ---------- discovery ---------- */
 .found { display: grid; gap: 8px; margin-top: 10px; }

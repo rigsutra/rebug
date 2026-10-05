@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
 from ..models import Finding, StageResult
 from ..proc import progress, run_cmd
+from ..tls import ca_bundle
 from ..testlog import log_of
 
 SEV = {0: "high", 1: "medium", 2: "low", 3: "info"}  # spectral: error, warn, info, hint
@@ -28,14 +30,19 @@ def run(spec, cfg, out: Path) -> StageResult:
     cmd = [npx, "--yes", "--prefer-offline", "@stoplight/spectral-cli", "lint", str(spec_file),
            "--ruleset", str(ruleset), "-f", "json", "--quiet"]
     progress(cfg, "lint", "Checking the Swagger document with Spectral")
-    p = run_cmd(cmd, cancel=cfg.cancel, timeout=300)
+    p = run_cmd(cmd, cancel=cfg.cancel, timeout=300, env={**os.environ, "NODE_EXTRA_CA_CERTS": ca_bundle()})
+    if p.returncode != 0 and not p.stdout.strip():
+        # Spectral also exits non-zero when it found problems, but then it prints them as JSON
+        res.status = "error"
+        res.note = (p.stderr.strip() or f"Spectral (npx) exited with code {p.returncode} and printed nothing")[-500:]
+        return res
     try:
         items = json.loads(p.stdout or "[]")
     except json.JSONDecodeError:
         res.status, res.note = "error", (p.stderr or p.stdout)[-500:]
         return res
     selected = {(o.path, o.method) for o in spec.operations} if spec.filtered else None
-    selected_paths = {p for p, _ in selected} if selected else None
+    selected_paths = {p for p, _ in selected} if selected is not None else None
     for it in items:
         jp = it.get("path", [])
         if selected is not None and len(jp) >= 2 and jp[0] == "paths":

@@ -47,6 +47,10 @@ Structure
   (`orderId: $response.body#/id`).
 - Examples must validate against their schema. Add examples for boundary values.
 - Old endpoints are marked `deprecated: true`, not removed from the spec while still served.
+- A method a path doesn't support returns 405 Method Not Allowed with an `Allow` header, not 404.
+  Express: mount a method-not-allowed middleware after all routes and before any catch-all or
+  404 handler (see SWAGGER_GUIDE.md §4.2). ASP.NET Core does this itself unless a fallback route
+  swallows it.
 
 Before finishing an API change, check: does the spec now describe exactly what the code does,
 for success, every error status, auth, and validation?

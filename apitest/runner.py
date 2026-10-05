@@ -14,6 +14,8 @@ from .report import write_reports
 from .spec import METHODS, Spec, filter_operations, load_spec
 from .stages import authz, conformance, lint, types, zap
 from . import coverage, htmlreport
+from .auth import current_headers, has_user, make_providers
+from .proc import progress
 from .testlog import TestLog, write_csv
 
 STAGE_FUNCS = {"lint": lint.run, "conformance": conformance.run, "types": types.run,
@@ -29,7 +31,21 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
     out.mkdir(parents=True, exist_ok=True)
     emit({"type": "spec_loading", "spec": cfg.spec})
     started = time.time()
-    spec = load_spec(cfg.spec, cfg.headers, cfg.timeout)
+    if cfg.login_a or cfg.login_b or cfg.auth_a or cfg.auth_b:
+        def on_login(p):
+            left = max(0, int(p.expires_at - time.time()))
+            progress(cfg, "auth", f"Logged in as {p.label} (login #{p.logins}). Token valid for {left // 60} min "
+                     f"{left % 60} s (expiry from {p.expiry_source}); a new one is fetched 30 s before it expires.",
+                     level="ok")
+        emit({"type": "spec_loading", "spec": cfg.spec, "msg": "Logging in"})
+        make_providers(cfg)  # raises LoginError with a readable message
+        # on_login is set only now, so the first login (made here or before) is reported once, below
+        for p in (cfg.auth_a, cfg.auth_b):
+            if p is not None:
+                p.on_login = on_login
+                if p.logins == 1:
+                    on_login(p)
+    spec = load_spec(cfg.spec, current_headers(cfg), cfg.timeout)
     if cfg.operations:
         spec = filter_operations(spec, cfg.operations)
     all_ops = list(spec.operations)  # before exclusions, so the report can say what was excluded
@@ -44,7 +60,9 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
     base = cfg.base_url or spec.base_url
     emit({"type": "spec", "version": spec.version, "operations": len(spec.operations), "base_url": base,
           "labels": [o.label for o in spec.operations]})
-    cfg.testlog = TestLog(out / "test-log.ndjson", list(cfg.headers.values()) + list(cfg.headers_b.values()))
+    cfg.testlog = TestLog(out / "test-log.ndjson", list(cfg.headers.values()) + list(cfg.headers_b.values())
+                          + list(cfg.variables.values()),
+                          token_sources=[p for p in (cfg.auth_a, cfg.auth_b) if p is not None])
 
     results: list[StageResult] = []
     cancelled = False
@@ -72,14 +90,15 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
     annotate(spec, base, results)
     write_reports(out, cfg.spec, base, results)
     write_csv(out / "test-log.ndjson", out / "test-log.csv")
-    settings = {"stages": cfg.stages, "headers": cfg.headers, "headers_b": cfg.headers_b, "bola": cfg.bola,
+    settings = {"stages": cfg.stages, "headers": cfg.headers or ({"login": "auto"} if has_user(cfg, "a") else {}),
+                "headers_b": cfg.headers_b or ({"login": "auto"} if has_user(cfg, "b") else {}), "bola": cfg.bola,
                 "exclude_paths": cfg.exclude_paths, "operations": cfg.operations}
     cov = coverage.build(all_ops, settings, {r.name: {"status": r.status, "note": r.note} for r in results},
                          out / "test-log.ndjson")
     coverage.write(cov, out)
     htmlreport.build(out, {"project_name": cfg.title, "spec": cfg.spec, "status": "cancelled" if cancelled else "done",
                            "started": started, "finished": time.time(), "operations": cfg.operations,
-                           "headers": bool(cfg.headers), "headers_b": bool(cfg.headers_b)}, cov)
+                           "headers": has_user(cfg, "a"), "headers_b": has_user(cfg, "b")}, cov)
     emit({"type": "cancelled" if cancelled else "done", "report": str(out / "test-report.html")})
     return results
 
@@ -92,7 +111,8 @@ def _template_regex(path: str) -> re.Pattern:
 def annotate(spec: Spec, base: str, results: list[StageResult]) -> None:
     """Fill Finding.operation ("GET /path") so findings can be shown per API."""
     labels = {o.label for o in spec.operations}
-    by_regex = [(o, _template_regex(o.path)) for o in spec.operations]
+    # fewest {params} first, so /items/mine wins over /items/{id} (stable: spec order breaks ties)
+    by_regex = [(o, _template_regex(o.path)) for o in sorted(spec.operations, key=lambda o: o.path.count("{"))]
     base_path = urlparse(base).path.rstrip("/") if base else ""
     for r in results:
         for f in r.findings:

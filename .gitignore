@@ -4,3 +4,5 @@ __pycache__/
 reports/
 reports_uvicorn.*
 .hypothesis/
+.schemathesis/
+.coverage

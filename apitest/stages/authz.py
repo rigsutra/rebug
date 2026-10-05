@@ -12,7 +12,9 @@ from pathlib import Path
 
 import httpx
 
+from ..discover import client_for
 from ..models import Finding, StageResult
+from ..auth import current_headers, has_user
 from ..proc import check, progress
 from ..testlog import log_of
 
@@ -46,7 +48,7 @@ def run(spec, cfg, out: Path) -> StageResult:
         ops = [o for o in ops if o.method in SAFE]
     checked = 0
     seen: set[str] = set()
-    with httpx.Client(timeout=cfg.timeout, follow_redirects=False) as c:
+    with client_for(base, timeout=cfg.timeout, follow_redirects=False) as c:
         total = len(ops) + len(cfg.bola)
         for i, op in enumerate(ops):
             check(cfg)
@@ -75,7 +77,7 @@ def run(spec, cfg, out: Path) -> StageResult:
                 elif op.method in SAFE:
                     progress(cfg, "authz", "Public endpoint: checking headers and error leaks", op=op.label,
                              done=i, total=total)
-                    r = _send(c, op, base, cfg.headers)
+                    r = _send(c, op, base, current_headers(cfg))
                     checked += 1
                     issues = _passive_issues(r)
                     _log(cfg, "Public API: response checked for leaked errors, security headers and CORS", r, op.label,
@@ -136,7 +138,7 @@ def _bola(c, cfg, base, done_before: int = 0, total: int | None = None) -> list[
     out: list[Finding] = []
     if not cfg.bola:
         return out
-    if not cfg.headers_b:
+    if not has_user(cfg, "b"):
         return [Finding("authz", "info", "BOLA scenarios skipped", "",
                         "Pass --header-b with user B's credentials.")]
     for n, sc in enumerate(cfg.bola):
@@ -151,7 +153,7 @@ def _bola(c, cfg, base, done_before: int = 0, total: int | None = None) -> list[
         body = {"json": sc["body"]} if "body" in sc else {}
         op = f"{method} {path.split('?')[0]}"
         try:
-            a = c.request(method, url, headers=cfg.headers, **body)
+            a = c.request(method, url, headers=current_headers(cfg, "a"), **body)
             ok_a = 200 <= a.status_code < 300
             _log(cfg, "Cross-user check, step 1: user A (the owner) reads its own data", a, op,
                  "2xx: the owner can access it", "pass" if ok_a else "error",
@@ -163,7 +165,7 @@ def _bola(c, cfg, base, done_before: int = 0, total: int | None = None) -> list[
                 out.append(Finding("authz", "info", "BOLA scenario inconclusive", label,
                                    f"Owner (user A) got HTTP {a.status_code}; fix the scenario's IDs."))
                 continue
-            b = c.request(method, url, headers=cfg.headers_b, **body)
+            b = c.request(method, url, headers=current_headers(cfg, "b"), **body)
             leaked = 200 <= b.status_code < 300
             _log(cfg, "Cross-user check, step 2: user B tries to read user A's data", b, op,
                  "401, 403 or 404: user B must not see user A's data",

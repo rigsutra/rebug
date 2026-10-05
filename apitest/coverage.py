@@ -88,14 +88,21 @@ def build(operations, settings: dict, stage_results: dict, log_path: Path) -> di
 
     # run-level warnings, most important first
     secured = [o for o in operations if o.secured]
+    perms = _missing_permissions(by_op)
     if secured and not has_a and "conformance" in stages:
         warnings.append(f"No token was set for user A, but {len(secured)} of {len(operations)} APIs require login. "
                         "Their behaviour tests only saw \"401 Unauthorized\", so the real logic behind them was never "
                         "tested. Add a token under Settings → Test users and run again.")
+    elif perms and has_a:
+        listed = "; ".join(f"`{p}` (needed by {', '.join(sorted(ops))})" for p, ops in sorted(perms.items()))
+        warnings.append(f"User A logged in fine but doesn't have permission for some APIs: {listed}. The API answered "
+                        "\"403 Forbidden: insufficient scope\", so those APIs' real behaviour was never tested. Give "
+                        "user A a role with these permissions, or check that the auth service actually defines them "
+                        "(if even an administrator lacks one, it's probably missing there).")
     elif secured_401["refused"] and secured_401["refused"] >= 0.9 * max(secured_401["total"], 1) and has_a:
         warnings.append("User A's token was refused for almost every request to protected APIs (401/403). It may be "
-                        "expired, for the wrong environment, or missing scopes. Most behaviour tests only covered the "
-                        "\"not logged in\" path.")
+                        "expired, for the wrong environment, or missing permissions. Most behaviour tests only covered "
+                        "the \"not logged in\" path.")
     writes_ok = sum(1 for e in iter_entries(log_path)
                     if (e.get("request") or {}).get("method", "").lower() in WRITE
                     and 200 <= ((e.get("response") or {}).get("status") or 0) < 300)
@@ -121,6 +128,27 @@ def build(operations, settings: dict, stage_results: dict, log_path: Path) -> di
     return {"warnings": warnings, "apis": apis, "totals": dict(totals)}
 
 
+def _missing_permissions(by_op: dict) -> dict[str, set]:
+    """permission -> APIs, from 403 bodies like {"required": ["read:aggregation"], ...}."""
+    out: dict[str, set] = defaultdict(set)
+    for op, entries in by_op.items():
+        for e in entries:
+            rs = e.get("response") or {}
+            if rs.get("status") != 403 or not rs.get("body"):
+                continue
+            try:
+                doc = json.loads(rs["body"])
+            except ValueError:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            req = doc.get("required") or doc.get("requiredScopes") or doc.get("required_scopes")
+            if isinstance(req, list):
+                for p in req:
+                    out[str(p)].add(op or "?")
+    return out
+
+
 def _valid(p):
     try:
         re.compile(p)
@@ -142,8 +170,14 @@ def _conformance(o, mine, has_a, secured_401):
         secured_401["total"] += len(mine)
     spread = ", ".join(f"{c}×{n}" for c, n in sorted(codes.items(), key=lambda x: str(x[0])))
     if o.secured and accepted == 0 and refused:
-        why = ("no token was set for user A" if not has_a else
-               "user A's token was refused (expired, wrong environment or missing scopes?)")
+        perms = sorted(_missing_permissions({o.label: mine}))
+        if not has_a:
+            why = "no token was set for user A"
+        elif perms and codes.get(403, 0) >= codes.get(401, 0):
+            why = (f"user A logged in but lacks the permission {', '.join(f'`{p}`' for p in perms)} "
+                   "(the API answered 403 insufficient scope)")
+        else:
+            why = "user A's token was refused (expired, wrong environment or missing permissions?)"
         parts = [f"{refused} refused with 401/403"]
         bad_input = sum(n for c, n in codes.items() if c in (400, 422))
         crashed = sum(n for c, n in codes.items() if isinstance(c, int) and c >= 500)
@@ -153,7 +187,7 @@ def _conformance(o, mine, has_a, secured_401):
             parts.append(f"{crashed} crashed the server")
         return _item("conformance", name, "partial",
                      f"None of the {len(mine)} requests was accepted ({', '.join(parts)}) because {why}. Only the "
-                     "\"not logged in\" behaviour was tested; the API's real logic was never reached.", len(mine), fails)
+                     "refusal itself was tested; the API's real logic was never reached.", len(mine), fails)
     return _item("conformance", name, "tested",
                  f"{len(mine)} requests (responses: {spread}). {fails} failed a check." if fails else
                  f"{len(mine)} requests (responses: {spread}); all checks passed.", len(mine), fails)

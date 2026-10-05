@@ -3,7 +3,7 @@
   "method": "GET",
   "path_template": "/users/{uid}/orders/{oid}",
   "fingerprint": "f0c904dd",
-  "case_id": "5LGkwa",
+  "case_id": "15fDOX",
   "code_sample": "curl -X GET http://localhost:8000/users/0/orders/0",
   "sequence": [
     {
@@ -15,12 +15,12 @@
         "Accept-Encoding": "gzip, deflate",
         "Accept": "*/*",
         "Connection": "keep-alive",
-        "X-Schemathesis-TestCaseId": "5LGkwa"
+        "X-Schemathesis-TestCaseId": "15fDOX"
       },
       "response": {
         "status_code": 401,
         "headers": {
-          "date": "Fri, 02 Oct 2026 06:50:01 GMT",
+          "date": "Mon, 05 Oct 2026 05:32:05 GMT",
           "server": "uvicorn",
           "content-length": "25",
           "content-type": "application/json"
@@ -37,7 +37,7 @@
       ],
       "meta": {
         "generation": {
-          "time": 1.09999964479357e-05,
+          "time": 2.0499981474131346e-05,
           "mode": "negative"
         },
         "components": {
@@ -74,9 +74,7 @@
         "oid": "0"
       },
       "query": {},
-      "case_headers": {
-        "Authorization": "[Filtered]"
-      },
+      "case_headers": {},
       "cookies": {},
       "case_body": {
         "encoding": "none"

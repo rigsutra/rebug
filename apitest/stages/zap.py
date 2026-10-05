@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 from ..models import Finding, StageResult
+from ..auth import current_headers
 from ..proc import progress, run_cmd
 from ..testlog import OpMatcher, log_of
 
@@ -24,8 +27,9 @@ def _docker_ok() -> bool:
 
 def _for_container(url: str) -> str:
     u = urlparse(url)
-    if u.hostname in ("localhost", "127.0.0.1"):
-        netloc = "host.docker.internal" + (f":{u.port}" if u.port else "")
+    if u.hostname in ("localhost", "127.0.0.1", "::1"):
+        userinfo = u.netloc.rpartition("@")[0]
+        netloc = (userinfo + "@" if userinfo else "") + "host.docker.internal" + (f":{u.port}" if u.port else "")
         return urlunparse(u._replace(netloc=netloc))
     return url
 
@@ -63,20 +67,24 @@ def run(spec, cfg, out: Path) -> StageResult:
     base = cfg.base_url or spec.base_url
     (out / "spec.json").write_text(spec.text, encoding="utf-8")
     zap_opts = []
-    for i, (k, v) in enumerate(cfg.headers.items()):
-        zap_opts += [f"-config replacer.full_list({i}).description=h{i}",
-                     f"-config replacer.full_list({i}).enabled=true",
-                     f"-config replacer.full_list({i}).matchtype=REQ_HEADER",
-                     f"-config replacer.full_list({i}).matchstr={k}",
-                     f"-config replacer.full_list({i}).regex=false",
-                     f"-config replacer.full_list({i}).replacement={v}"]
+    if cfg.auth_a is not None:
+        # ZAP gets one fixed token at start and can't refresh it: make sure it has a fresh one
+        cfg.auth_a.ensure_valid_for(20 * 60)
+        left = int(cfg.auth_a.expires_at - time.time())
+        if left < 15 * 60:
+            progress(cfg, "zap", f"Note: the token lasts {left // 60} min and ZAP can't renew it mid-scan; "
+                                 "if the scan takes longer, its last requests will get 401.", level="warn")
+    for i, (k, v) in enumerate(current_headers(cfg).items()):
+        for opt in (f"description=h{i}", "enabled=true", "matchtype=REQ_HEADER", f"matchstr={k}", "regex=false",
+                    f"replacement={v}"):
+            zap_opts += ["-config", f"replacer.full_list({i}).{opt}"]
     name = f"apitest-zap-{uuid.uuid4().hex[:8]}"
     cmd = ["docker", "run", "--rm", "--name", name, "--add-host", "host.docker.internal:host-gateway",
            "-v", f"{out.resolve()}:/zap/wrk:rw", cfg.zap_image, "zap-api-scan.py",
            "-t", "spec.json", "-f", "openapi", "-O", _for_container(base),
            "-J", "zap.json", "-r", "zap.html", "-I", "-d"]  # -d: debug output includes scan progress %
     if zap_opts:
-        cmd += ["-z", " ".join(zap_opts)]
+        cmd += ["-z", shlex.join(zap_opts)]  # ZAP shlex-splits -z, so values with spaces must be quoted
     progress(cfg, "zap", "Starting the OWASP ZAP container")
     # Killing the docker client doesn't stop the container, so remove it by name on cancel
     p = run_cmd(cmd, cancel=cfg.cancel, timeout=3600,

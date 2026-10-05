@@ -53,7 +53,7 @@ def _load_text(source: str, headers: dict[str, str], timeout: float) -> tuple[st
         r.raise_for_status()
         doc = parse_spec(r.text)
         if doc is not None:
-            return r.text, doc, source, False
+            return r.text, doc, str(r.url), False  # after redirects: relative servers resolve against it
         # Not a spec: maybe a Swagger UI page. Use its embedded spec or the first spec URL it references.
         emb, urls = resolve_page(c, str(r.url), r.text)
         if emb is not None:
@@ -62,7 +62,7 @@ def _load_text(source: str, headers: dict[str, str], timeout: float) -> tuple[st
             rr = c.get(u)
             d = parse_spec(rr.text) if rr.status_code == 200 else None
             if d is not None:
-                return rr.text, d, u, True
+                return rr.text, d, str(rr.url), True
     return r.text, None, source, False
 
 
@@ -97,7 +97,11 @@ def _resolve(raw: dict, node):
             return node
         cur = raw
         for part in ref[2:].split("/"):
-            cur = cur.get(part.replace("~1", "/").replace("~0", "~"), {})
+            part = part.replace("~1", "/").replace("~0", "~")
+            if isinstance(cur, list):
+                cur = cur[int(part)] if part.isascii() and part.isdigit() and int(part) < len(cur) else {}
+            else:
+                cur = cur.get(part, {}) if isinstance(cur, dict) else {}
         node = cur
         seen += 1
     return node
@@ -121,11 +125,21 @@ def _is_secured(sec) -> bool:
     return bool(sec) and all(bool(s) for s in sec)
 
 
+def _server_url(server: dict) -> str:
+    """The server URL with each {variable} replaced by its default."""
+    variables = server.get("variables") or {}
+
+    def sub(m):
+        v = variables.get(m[1]) if isinstance(variables, dict) else None
+        return str(v["default"]) if isinstance(v, dict) and "default" in v else m[0]
+    return re.sub(r"\{([^{}]+)\}", sub, server.get("url", "/"))
+
+
 def _derive_base_url(raw: dict, source: str) -> str:
     if "openapi" in raw:
         servers = raw.get("servers") or []
         if servers:
-            url = servers[0].get("url", "/")
+            url = _server_url(servers[0])
             if re.match(r"^https?://", url):
                 return url.rstrip("/")
             if re.match(r"^https?://", source):  # relative server URL: resolve against spec URL

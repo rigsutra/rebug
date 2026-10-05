@@ -3,7 +3,10 @@ name = "apitest"
 version = "0.2.0"
 description = "Point it at a Swagger/OpenAPI URL: lint, conformance, wrong-type probing, authz and DAST in one run"
 requires-python = ">=3.10"
-dependencies = ["schemathesis>=4", "httpx", "pyyaml", "jinja2", "fastapi", "uvicorn"]
+dependencies = ["schemathesis>=4", "httpx", "pyyaml", "jinja2", "fastapi", "uvicorn", "cryptography"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov", "hypothesis"]
 
 [project.scripts]
 apitest = "apitest.cli:main"
@@ -13,3 +16,11 @@ packages = ["apitest", "apitest.stages", "apitest.web"]
 
 [tool.setuptools.package-data]
 "apitest.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: takes more than a couple of seconds (deselect with -m 'not slow')",
+    "e2e: drives the real examples/demo_api.py end to end",
+    "external: needs a real external tool (Node, Docker); skipped when it is absent",
+]

@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import sys
 
+import httpx
+import yaml
+
+from .auth import LoginError
 from .config import ALL_STAGES, expand_env, load_config, parse_header
 from .models import SEVERITIES
 from .runner import STAGE_FUNCS, failed, run_pipeline
@@ -39,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _print_event(e: dict) -> None:
     t = e["type"]
     if t == "spec_loading":
-        print(f"Loading spec: {e['spec']}")
+        print(f"{e['msg']}..." if e.get("msg") else f"Loading spec: {e['spec']}")
     elif t == "spec":
         print(f"  {e['version']}, {e['operations']} operations, base URL: {e['base_url'] or '(none)'}")
     elif t == "stage_start":
@@ -51,13 +55,12 @@ def _print_event(e: dict) -> None:
 
 
 def _discover(args) -> int:
-    from .discover import discover
+    from .discover import discover, not_found_message
     from .spec import load_spec
-    headers = dict(parse_header(h) for h in args.header)
+    headers = {k: expand_env(v) for k, v in (parse_header(h) for h in args.header)}
     res = discover(args.url, headers)
     if not res["specs"]:
-        print(f"No Swagger/OpenAPI document found ({res['tried']} locations tried). "
-              "Pass the spec URL directly if it lives somewhere unusual.")
+        print(not_found_message(res) + " Pass the spec URL directly if it lives somewhere unusual.")
         return 1
     for s in res["specs"]:
         print(f"\n{s['title'] or '(untitled)'} {s['api_version']}  [{s['spec_version']}]  {s['url']}"
@@ -75,7 +78,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "discover":
         return _discover(args)
+    try:
+        return _run(args)
+    # user errors: bad header / ${VAR} / config key / --op, unreadable spec or config, spec URL unreachable
+    except (LoginError, ValueError, OSError, yaml.YAMLError, httpx.HTTPError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
+
+def _run(args) -> int:
     cfg = load_config(args.config)
     if args.spec:
         cfg.spec = args.spec
@@ -107,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: unknown stage(s): {bad}", file=sys.stderr)
         return 2
 
+    cfg.on_progress = lambda p: print(f"  {p['msg']}") if p["stage"] == "auth" else None
     results = run_pipeline(cfg, _print_event)
     return 1 if failed(cfg, results) else 0
 

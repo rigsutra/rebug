@@ -397,6 +397,40 @@ app.get("/swagger.json", (_req, res) =>
 - Set `helmet()`: it adds `X-Content-Type-Options` and other headers apitest checks for.
 - Validate `req.params` and `req.query`, not only the body. Express gives you strings, so
   `/orders/abc` must return 400, not 500.
+- **Unsupported methods must return 405, not 404.** If `/orders` only has GET, then `DELETE /orders`
+  should get `405 Method Not Allowed` with an `Allow: GET, HEAD, OPTIONS` header. Express doesn't do
+  this by itself, and it often answers 404 (or a catch-all/gateway route swallows the request).
+  Mount this after every route and before any catch-all or 404 handler:
+
+  ```ts
+  // Known path + unsupported method -> 405 with Allow (RFC 9110 §15.5.6). Express 4.
+  export function methodNotAllowedHandler(app: Express): RequestHandler {
+    return (req, res, next) => {
+      const methods = new Set<string>();
+      for (const layer of (app as any)._router?.stack ?? []) {
+        if (!layer.route || !layer.regexp?.test(req.path)) continue;
+        if (layer.route.methods._all) return next();
+        for (const [m, on] of Object.entries(layer.route.methods)) if (on) methods.add(m.toUpperCase());
+      }
+      if (methods.size === 0 || methods.has(req.method)) return next(); // unknown path or allowed
+      if (methods.has("GET")) methods.add("HEAD");
+      methods.add("OPTIONS");
+      const allowed = [...methods].sort();
+      res.setHeader("Allow", allowed.join(", "));
+      res.status(405).type("application/problem+json").json({
+        type: "about:blank", title: "Method Not Allowed", status: 405,
+        detail: `${req.method} is not supported for ${req.path}`, allowed,
+      });
+    };
+  }
+  // routes.ts: register all routes, then
+  app.use(methodNotAllowedHandler(app));
+  // ...then catch-alls / notFoundHandler
+  ```
+
+  RZ-NTT has this as `server/middleware/method-not-allowed.ts`, with tests. ASP.NET Core's endpoint
+  routing already answers 405 when a route matches with another method; check that a
+  `MapFallback` or catch-all route isn't turning it into 404.
 
 ---
 
@@ -413,6 +447,7 @@ Every item below maps to a check apitest runs.
 - [ ] Request bodies list all constraints the server enforces, and the server enforces all constraints listed
 - [ ] Path and query parameters have types and formats; required ones are marked
 - [ ] One shared error schema (Problem Details) for all 4xx responses
+- [ ] An HTTP method a path doesn't support returns 405 with an `Allow` header, not 404
 - [ ] Unique camelCase `operationId`, plus `summary` and `tags`, on every operation
 - [ ] `links` from create operations to read/update/delete of the same resource
 - [ ] Examples for boundary values, and they validate against their schema
@@ -431,4 +466,5 @@ Every item below maps to a check apitest runs.
 | `BOLA: user B accessed user A's resource` | Add an ownership check: filter by the current user's ID in the query |
 | `Error response leaks stack trace` | Use a production error handler (`UseExceptionHandler` / an Express error middleware) |
 | `Missing security header` | `app.UseHsts()` plus header middleware in .NET; `helmet()` in Express |
+| `Unsupported methods don't get 405` ("answered … with HTTP 404; the standard answer is 405") | Express: the 405 middleware in section 4.2. .NET: look for a fallback/catch-all route swallowing it |
 | Many `lint` warnings | Section 2.9 |

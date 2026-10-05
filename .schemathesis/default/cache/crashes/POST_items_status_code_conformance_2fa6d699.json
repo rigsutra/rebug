@@ -3,8 +3,8 @@
   "method": "POST",
   "path_template": "/items",
   "fingerprint": "2fa6d699",
-  "case_id": "KNmnEM",
-  "code_sample": "curl -X POST -H 'Authorization: [Filtered]' -H 'Content-Type: application/json' -d '{\"\\ud993\\udf1e\\u0005\\u00b5\\u008d\\u00c8\": [\"\", null], \"\\u00af\\ud8f9\\udf9a?\\u00eeXd\\u00b0\": {\"\\u00b1\": 638203, \"\\u00ebAL\\u0089\\u00a4\\u00fd\\u0016\\ud8bb\\udf06'\"'\"'4\\r\\u00ff\\u00a5m\": -91514758, \"\\ud8cd\\udc79<\\udbad\\udc88\\u009f\\u008d\\u00ea\": \"\\u009a\\udb18\\udeec\"}, \"\": {}, \"FALSE\": [], \"\\ud900\\udc63\\f \": {\"\\uda9e\\udeeb\": {}}, \"id\": 0, \"price\": -7.029701916535146e+16, \"name\": \"m2\\u0004u\\uda32\\udfe6\\uda17\\udefa\\u0016\\u00fc\\u00a6\\u0095\\uda19\\udd0f\\ud978\\uddca<\\u008dh\"}' http://localhost:8000/items",
+  "case_id": "BOzhNa",
+  "code_sample": "curl -X POST -H 'Authorization: [Filtered]' -H 'Content-Type: application/json' -d '{\"\\u0096\\uda38\\ude5a}/\\u00a0\": [null, \"\\u00aa\\u00a9\\u0017\\u00f0\", null], \"\": false, \"id\": 0, \"price\": -5.622460074574019e+255, \"in_stock\": true, \"name\": \"item-0\"}' http://localhost:8000/items",
   "sequence": [
     {
       "method": "POST",
@@ -16,14 +16,14 @@
         "Accept": "*/*",
         "Connection": "keep-alive",
         "Authorization": "[Filtered]",
-        "X-Schemathesis-TestCaseId": "KNmnEM",
+        "X-Schemathesis-TestCaseId": "BOzhNa",
         "Content-Type": "application/json",
-        "Content-Length": "459"
+        "Content-Length": "162"
       },
       "response": {
         "status_code": 500,
         "headers": {
-          "date": "Fri, 02 Oct 2026 06:50:06 GMT",
+          "date": "Mon, 05 Oct 2026 05:32:33 GMT",
           "server": "uvicorn",
           "content-length": "21",
           "content-type": "text/plain; charset=utf-8"
@@ -40,7 +40,7 @@
       ],
       "meta": {
         "generation": {
-          "time": 0.01205729998764582,
+          "time": 0.006133500020951033,
           "mode": "positive"
         },
         "components": {
@@ -68,7 +68,19 @@
           }
         ],
         "pool_misses": [],
-        "semantic_draws": [],
+        "semantic_draws": [
+          {
+            "path": [
+              "name"
+            ],
+            "type_token": "string",
+            "format_token": null,
+            "pattern_hash": null,
+            "normalized_name": "name",
+            "value": "item-0",
+            "source_operation": "GET /items/{item_id}"
+          }
+        ],
         "dictionary_draws": [],
         "constants_draws": [],
         "raw_containers": {}
@@ -83,23 +95,16 @@
       "case_body": {
         "encoding": "json",
         "value": {
-          "\ud993\udf1e\u0005\u00b5\u008d\u00c8": [
-            "",
+          "\u0096\uda38\ude5a}/\u00a0": [
+            null,
+            "\u00aa\u00a9\u0017\u00f0",
             null
           ],
-          "\u00af\ud8f9\udf9a?\u00eeXd\u00b0": {
-            "\u00b1": 638203,
-            "\u00ebAL\u0089\u00a4\u00fd\u0016\ud8bb\udf06'4\r\u00ff\u00a5m": -91514758,
-            "\ud8cd\udc79<\udbad\udc88\u009f\u008d\u00ea": "\u009a\udb18\udeec"
-          },
-          "": {},
-          "FALSE": [],
-          "\ud900\udc63\f ": {
-            "\uda9e\udeeb": {}
-          },
+          "": false,
           "id": 0,
-          "price": -7.029701916535146e+16,
-          "name": "m2\u0004u\uda32\udfe6\uda17\udefa\u0016\u00fc\u00a6\u0095\uda19\udd0f\ud978\uddca<\u008dh"
+          "price": -5.622460074574019e+255,
+          "in_stock": true,
+          "name": "item-0"
         }
       },
       "media_type": "application/json",

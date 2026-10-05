@@ -3,7 +3,7 @@
   "method": "GET",
   "path_template": "/admin/stats",
   "fingerprint": "442179fa",
-  "case_id": "Rn2Ziu",
+  "case_id": "wUMrD2",
   "code_sample": "curl -X GET http://localhost:8000/admin/stats",
   "sequence": [
     {
@@ -15,12 +15,12 @@
         "Accept-Encoding": "gzip, deflate",
         "Accept": "*/*",
         "Connection": "keep-alive",
-        "X-Schemathesis-TestCaseId": "Rn2Ziu"
+        "X-Schemathesis-TestCaseId": "wUMrD2"
       },
       "response": {
         "status_code": 200,
         "headers": {
-          "date": "Fri, 02 Oct 2026 06:49:59 GMT",
+          "date": "Mon, 05 Oct 2026 05:32:03 GMT",
           "server": "uvicorn",
           "content-length": "22",
           "content-type": "application/json"
@@ -37,7 +37,7 @@
       ],
       "meta": {
         "generation": {
-          "time": 1.2400007108226418e-05,
+          "time": 1.680001150816679e-05,
           "mode": "negative"
         },
         "components": {
@@ -66,9 +66,7 @@
       "path": "/admin/stats",
       "path_parameters": {},
       "query": {},
-      "case_headers": {
-        "Authorization": "[Filtered]"
-      },
+      "case_headers": {},
       "cookies": {},
       "case_body": {
         "encoding": "none"

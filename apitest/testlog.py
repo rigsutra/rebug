@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 BODY_LIMIT = 32 * 1024
+JWT = re.compile(r"eyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]{5,}")
 SENSITIVE = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "x-auth-token"}
 CSV_FIELDS = ["seq", "time", "stage", "operation", "scenario", "expected", "verdict", "explanation", "method",
               "url", "status", "elapsed_ms", "request_body", "response_body"]
@@ -37,7 +38,9 @@ class OpMatcher:
     """Maps a concrete request (method + URL) back to the spec operation it hit."""
 
     def __init__(self, operations, base_url: str):
-        self.ops = [(o.method.upper(), o.label, _template_regex(o.path)) for o in operations]
+        # fewest {params} first, so /items/mine wins over /items/{id} (stable: spec order breaks ties)
+        self.ops = [(o.method.upper(), o.label, _template_regex(o.path))
+                    for o in sorted(operations, key=lambda o: o.path.count("{"))]
         self.base_path = urlparse(base_url).path.rstrip("/") if base_url else ""
 
     def __call__(self, method: str, url: str) -> str:
@@ -53,26 +56,36 @@ class OpMatcher:
 class TestLog:
     __test__ = False  # not a pytest class
 
-    def __init__(self, path: Path, secrets: list[str] | None = None):
+    def __init__(self, path: Path, secrets: list[str] | None = None, token_sources: list | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("", encoding="utf-8")
         self.secrets = sorted({s for s in (secrets or []) if s and len(s) >= 6}, key=len, reverse=True)
+        self.token_sources = token_sources or []  # TokenProviders: their current token is masked too
         self.seq = 0
         self._lock = threading.Lock()
 
     # ---------- masking ----------
     def _mask_text(self, s: str) -> str:
-        for sec in self.secrets:
+        for sec in self.secrets + [p.token for p in self.token_sources if getattr(p, "token", None)]:
             if sec in s:
                 s = s.replace(sec, "***")
-        return s
+        return JWT.sub("***jwt***", s) if "eyJ" in s else s  # any JWT, e.g. one returned by the API itself
 
     def _mask_value(self, name: str, value: str) -> str:
         if name.lower() in SENSITIVE:
             scheme, _, rest = value.partition(" ")
             return f"{scheme} ***" if rest and scheme.lower() in ("bearer", "basic", "token") else "***"
         return self._mask_text(value)
+
+    def _mask_obj(self, o):
+        if isinstance(o, str):
+            return self._mask_text(o)
+        if isinstance(o, list):
+            return [self._mask_obj(v) for v in o]
+        if isinstance(o, dict):
+            return {k: self._mask_obj(v) for k, v in o.items()}
+        return o
 
     def _headers(self, headers) -> dict:
         out = {}
@@ -114,7 +127,7 @@ class TestLog:
             entry = {"seq": self.seq, "ts": ts or time.time(), "stage": stage, "operation": operation,
                      "scenario": self._mask_text(scenario), "expected": expected, "verdict": verdict,
                      "explanation": self._mask_text(explanation), "request": req, "response": resp,
-                     "details": details or {}}
+                     "details": self._mask_obj(details or {})}  # ZAP evidence can hold a token
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -176,6 +189,11 @@ def _detail_text(e: dict) -> str:
     return ""
 
 
+def _cell(v):
+    """Text the target API controls must not run as a spreadsheet formula (CSV injection)."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
 def write_csv(ndjson: Path, csv_path: Path) -> int:
     n = 0
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:  # BOM so Excel detects UTF-8
@@ -183,13 +201,14 @@ def write_csv(ndjson: Path, csv_path: Path) -> int:
         w.writeheader()
         for e in iter_entries(ndjson):
             rq, rs = e.get("request") or {}, e.get("response") or {}
-            w.writerow({"seq": e["seq"], "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"])),
+            w.writerow({k: _cell(v) for k, v in {"seq": e["seq"], "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"])),
                         "stage": e["stage"], "operation": e["operation"], "scenario": e["scenario"],
                         "expected": e["expected"], "verdict": e["verdict"],
                         "explanation": e.get("explanation") or _detail_text(e), "method": rq.get("method", ""),
                         "url": rq.get("url", ""), "status": rs.get("status", ""),
                         "elapsed_ms": rs.get("elapsed_ms", ""),
-                        "request_body": (rq.get("body") or "")[:2000], "response_body": (rs.get("body") or "")[:2000]})
+                        "request_body": (rq.get("body") or "")[:2000],
+                        "response_body": (rs.get("body") or "")[:2000]}.items()})
             n += 1
     return n
 

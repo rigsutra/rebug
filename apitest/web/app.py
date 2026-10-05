@@ -28,13 +28,18 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Res
 from pydantic import BaseModel, Field
 
 from ..config import ALL_STAGES, ENV_REF, Config, expand_env, parse_header
-from ..discover import discover
+from ..discover import discover, not_found_message
 from ..models import sev_rank
 from ..runner import run_pipeline
 from ..spec import load_spec
 from types import SimpleNamespace
 
+import os
+
 from .. import coverage as coverage_mod
+from ..secretstore import SecretStore
+from ..secretstore import check_name as check_secret_name
+from ..auth import REFRESH_MARGIN, LoginConfig, LoginError, TokenProvider, jwt_claims, literal_secrets
 from .. import htmlreport
 from ..stages.conformance import log_scenarios
 from ..testlog import TestLog, iter_entries, write_csv
@@ -49,9 +54,20 @@ _secrets: dict[str, dict[str, str]] = {}  # project id -> {"headers": text, "hea
 _lock = threading.RLock()
 
 
+_store: SecretStore | None = None
+
+
 def configure(data_dir: str | Path) -> None:
-    global DATA
+    global DATA, _store
     DATA = Path(data_dir).resolve()
+    _store = None
+
+
+def store() -> SecretStore:
+    global _store
+    if _store is None or _store.dir != DATA:
+        _store = SecretStore(DATA)
+    return _store
 
 
 def projects_dir() -> Path:
@@ -83,6 +99,20 @@ class ProjectIn(BaseModel):
     no_mutating_authz: bool = False
     exclude_paths: list[str] = Field(default_factory=list)
     bola: list[BolaIn] = Field(default_factory=list)
+    login_a: dict | None = None  # automatic login (auth.LoginConfig fields); secrets as ${VAR}
+    login_b: dict | None = None
+    secrets: dict[str, str] = Field(default_factory=dict)  # new/changed project secrets (encrypted on save)
+    delete_secrets: list[str] = Field(default_factory=list)
+
+
+class LoginTestIn(BaseModel):
+    login: dict
+    project_id: str = ""  # use this project's saved secrets
+    secrets: dict[str, str] = Field(default_factory=dict)  # values typed but not saved yet (not stored)
+
+
+class VarIn(BaseModel):
+    value: str
 
 
 class DiscoverIn(BaseModel):
@@ -134,9 +164,9 @@ def _ops_summary(spec) -> list[dict]:
     return out
 
 
-def _load_spec_info(spec_url: str, headers_text: str) -> dict:
+def _load_spec_info(spec_url: str, headers_text: str, variables: dict | None = None) -> dict:
     try:
-        headers = {k: expand_env(v) for k, v in _parse_headers(headers_text).items()}
+        headers = {k: expand_env(v, variables) for k, v in _parse_headers(headers_text).items()}
     except ValueError:
         headers = {}  # env var missing: try without auth, specs are usually public
     try:
@@ -168,6 +198,9 @@ def _write_project(p: dict) -> None:
 
 
 def _apply(p: dict, body: ProjectIn) -> None:
+    """Validate everything (secret names included) before changing `p`, so a 400 leaves nothing behind."""
+    if not body.name.strip():
+        raise HTTPException(400, "Name is required")
     if any(s not in ALL_STAGES for s in body.stages):
         raise HTTPException(400, "Unknown stage")
     try:
@@ -175,12 +208,75 @@ def _apply(p: dict, body: ProjectIn) -> None:
         saved_b, secret_b = _split_secret(body.headers_b)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    data = body.model_dump()
+    for name, value in body.secrets.items():
+        try:
+            if value:
+                check_secret_name(name)
+        except ValueError as e:
+            raise HTTPException(400, f"Secret {name!r}: {e}")
+    data = body.model_dump(exclude={"secrets", "delete_secrets"})
+    data["spec"] = data["spec"].strip()
     data["headers"], data["headers_b"] = saved_a, saved_b
+    for key, who in (("login_a", "User A"), ("login_b", "User B")):
+        data[key] = _clean_login(data.get(key), who)
     data["bola"] = [b for b in data["bola"] if b["path"]]
     data["exclude_paths"] = [x for x in data["exclude_paths"] if x.strip()]
+    for x in data["exclude_paths"]:
+        try:
+            re.compile(x)
+        except re.error as e:
+            raise HTTPException(400, f"Exclude paths: {x!r} is not a valid regular expression ({e})")
     p.update(data)
     _secrets[p["id"]] = {"headers": secret_a, "headers_b": secret_b}
+
+
+def _save_secrets(pid: str, body: ProjectIn) -> None:
+    try:
+        for name, value in body.secrets.items():
+            if value:
+                store().set(pid, name, value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    for name in body.delete_secrets:
+        store().delete(pid, name)
+
+
+def _variables(pid: str, pending: dict[str, str] | None = None) -> dict[str, str]:
+    try:
+        v = store().values(pid) if pid else {}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    v.update({k: x for k, x in (pending or {}).items() if x})
+    return v
+
+
+_LOGIN_TYPES = {"headers": dict, "fixed_minutes": (int, float), "timeout": (int, float)}  # every other field: text
+
+
+def _clean_login(raw: dict | None, who: str) -> dict | None:
+    """Validate an automatic-login config. Secrets must be ${VAR} references (never stored)."""
+    raw = {k: v for k, v in (raw or {}).items() if v is not None}  # null = the default
+    wrong = [k for k, v in raw.items() if k in LoginConfig.__dataclass_fields__ and (
+        isinstance(v, bool) or not isinstance(v, _LOGIN_TYPES.get(k, str))
+        or k == "headers" and not all(isinstance(x, str) for x in v.values()))]
+    if wrong:
+        raise HTTPException(400, f"{who} login settings are invalid: wrong type for {', '.join(wrong)}")
+    if not raw.get("url", "").strip():
+        return None
+    try:
+        lc = LoginConfig.from_dict(raw)
+    except TypeError as e:
+        raise HTTPException(400, f"{who} login settings are invalid: {e}")
+    if lc.token_type not in ("bearer", "header", "cookie") or lc.expiry not in ("jwt", "field", "fixed"):
+        raise HTTPException(400, f"{who}: unknown token type or expiry mode")
+    if not lc.token_path.strip():
+        raise HTTPException(400, f"{who}: say where the token is in the login response (e.g. data.accessToken)")
+    bad = literal_secrets(lc)
+    if bad:
+        raise HTTPException(400, f"{who}: {', '.join(bad)} contains a password or key typed directly. Write a name "
+                                 "like ${NTT_PASSWORD} there instead, and enter the value in the Secrets box "
+                                 "below it, where it's stored encrypted.")
+    return lc.to_dict()
 
 
 def _merged_headers(p: dict, key: str) -> str:
@@ -316,20 +412,32 @@ def _start(p: dict, operations: list[str], force: bool = False) -> str:
     running = _running_run(p["id"])
     if running:
         raise HTTPException(409, f"A run is already in progress for this project ({running}). Stop it first.")
+    variables = _variables(p["id"])
     try:
-        headers = {k: expand_env(v) for k, v in _parse_headers(_merged_headers(p, "headers")).items()}
-        headers_b = {k: expand_env(v) for k, v in _parse_headers(_merged_headers(p, "headers_b")).items()}
+        headers = {k: expand_env(v, variables) for k, v in _parse_headers(_merged_headers(p, "headers")).items()}
+        headers_b = {k: expand_env(v, variables) for k, v in _parse_headers(_merged_headers(p, "headers_b")).items()}
     except ValueError as e:
-        raise HTTPException(400, f"{e} (set it in the environment of the apitest server)")
+        raise HTTPException(400, str(e))
     scope = [o for o in p.get("operations", []) if (not operations or o["label"] in operations)
              and o["label"] not in _excluded(p)]
     secured = [o for o in scope if o.get("secured")]
-    if secured and not headers and not force:
+    # Automatic login: log in now, so wrong credentials fail here with a clear message
+    providers = {}
+    for key, label in (("login_a", "user A"), ("login_b", "user B")):
+        if p.get(key):
+            prov = TokenProvider(LoginConfig.from_dict(p[key]), label, variables=variables)
+            try:
+                prov.current_token()
+            except LoginError as e:
+                raise HTTPException(400, f"Login failed, so nothing was tested. {e}")
+            providers[key] = prov
+    if secured and not headers and "login_a" not in providers and not force:
         raise HTTPException(428, json.dumps({
             "code": "NO_TOKEN",
             "message": f"No token is set for user A, but {len(secured)} of the {len(scope)} APIs in this run need login. "
                        "Without one, every request to them is refused with 401 and their real behaviour isn't tested. "
-                       "Tokens typed directly into Settings are forgotten when the apitest server restarts."}))
+                       "Use \"Log in automatically\" (with the password saved as a project secret) so a token is "
+                       "always available."}))
     excluded = _excluded(p)
     if operations:
         known = {o["label"] for o in p.get("operations", [])}
@@ -348,7 +456,9 @@ def _start(p: dict, operations: list[str], force: bool = False) -> str:
         stages=p.get("stages") or list(ALL_STAGES), max_examples=p.get("max_examples", 50),
         fail_on=p.get("fail_on", "high"), out_dir=str(runs_dir() / run_id),
         no_mutating_authz=p.get("no_mutating_authz", False), exclude_paths=p.get("exclude_paths", []),
-        bola=p.get("bola", []), operations=operations, cancel=cancel, title=p["name"],
+        bola=p.get("bola", []), operations=operations, cancel=cancel, title=p["name"], variables=variables,
+        login_a=p.get("login_a"), login_b=p.get("login_b"),
+        auth_a=providers.get("login_a"), auth_b=providers.get("login_b"),
     )
     if operations:  # only run BOLA scenarios that belong to the selected operations
         sel = set(operations)
@@ -358,7 +468,9 @@ def _start(p: dict, operations: list[str], force: bool = False) -> str:
         "started": time.time(), "finished": None, "error": None, "spec": cfg.spec, "base_url": cfg.base_url,
         "operations": operations, "tested": None, "stages_requested": cfg.stages,
         "stages": {s: {"status": "pending"} for s in cfg.stages}, "fail_on": cfg.fail_on,
-        "headers": _mask(headers), "headers_b": _mask(headers_b), "spec_info": None,
+        "headers": _mask(headers) or ({"login": "automatic"} if "login_a" in providers else {}),
+        "headers_b": _mask(headers_b) or ({"login": "automatic"} if "login_b" in providers else {}),
+        "spec_info": None,
         "activity": None, "feed": [], "exclude_paths": cfg.exclude_paths, "bola": cfg.bola,
     }
     _runs[run_id] = state
@@ -401,6 +513,67 @@ def env():
 
 # ---------------- routes: discovery ----------------
 
+@app.get("/api/vars")
+def vars_status(names: str = "", project: str = ""):
+    """For each ${NAME}: saved as a project secret, available as an environment variable, or missing.
+    Never returns values."""
+    saved = {s["name"]: s for s in store().names(project)} if project else {}
+    out = []
+    for n in [x.strip() for x in names.split(",") if x.strip()][:50]:
+        try:
+            check_secret_name(n)
+        except ValueError as e:
+            out.append({"name": n, "source": None, "error": str(e)})
+            continue
+        src = "project" if n in saved else "environment" if n in os.environ else None
+        out.append({"name": n, "source": src, "updated": (saved.get(n) or {}).get("updated")})
+    return out
+
+
+@app.get("/api/projects/{pid}/secrets")
+def project_secrets(pid: str):
+    _read_project(pid)
+    return store().names(pid)
+
+
+@app.put("/api/projects/{pid}/secrets/{name}")
+def set_project_secret(pid: str, name: str, body: VarIn):
+    _read_project(pid)
+    try:
+        store().set(pid, name, body.value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{pid}/secrets/{name}")
+def delete_project_secret(pid: str, name: str):
+    _read_project(pid)
+    store().delete(pid, name)
+    return {"ok": True}
+
+
+@app.post("/api/login/test")
+def login_test(body: LoginTestIn):
+    """Try a login config. Returns when the token expires; never returns the token itself."""
+    lc_dict = _clean_login(body.login, "This login")
+    if not lc_dict:
+        raise HTTPException(400, "Enter the login URL first")
+    if body.project_id:
+        _read_project(body.project_id)
+    prov = TokenProvider(LoginConfig.from_dict(lc_dict), "this login",
+                         variables=_variables(body.project_id, body.secrets))
+    try:
+        tok = prov.current_token()
+    except LoginError as e:
+        raise HTTPException(400, str(e))
+    claims = jwt_claims(tok) or {}
+    return {"ok": True, "header": next(iter(prov.headers())), "token_preview": tok[:8] + "…",
+            "expires_at": prov.expires_at, "expires_in": int(prov.expires_at - time.time()),
+            "expiry_source": prov.expiry_source, "refresh_at": prov.expires_at - REFRESH_MARGIN,
+            "jwt": {k: claims[k] for k in ("sub", "email", "roles", "iat", "exp") if k in claims}}
+
+
 @app.post("/api/discover")
 def api_discover(body: DiscoverIn):
     try:
@@ -408,6 +581,7 @@ def api_discover(body: DiscoverIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     res = discover(body.url, headers)
+    res["message"] = "" if res["specs"] else not_found_message(res)
     for s in res["specs"]:  # include the API list of each document found
         try:
             spec = load_spec(s["url"], headers)
@@ -442,13 +616,12 @@ def list_projects():
 
 @app.post("/api/projects")
 def create_project(body: ProjectIn):
-    if not body.name.strip():
-        raise HTTPException(400, "Name is required")
     p = {"id": _slug(body.name), "created": time.time()}
     _apply(p, body)
-    p.update(_load_spec_info(body.spec, _merged_headers(p, "headers")))
+    p.update(_load_spec_info(body.spec, _merged_headers(p, "headers"), _variables("", body.secrets)))
     p["updated"] = time.time()
     _write_project(p)
+    _save_secrets(p["id"], body)
     return {"id": p["id"]}
 
 
@@ -458,6 +631,7 @@ def get_project(pid: str):
     p["headers"] = _merged_headers(p, "headers")
     p["headers_b"] = _merged_headers(p, "headers_b")
     p["running"] = _running_run(pid)
+    p["secrets"] = store().names(pid)  # names only, never values
     excluded = _excluded(p)
     for o in p.get("operations", []):
         o["excluded"] = o["label"] in excluded
@@ -498,8 +672,9 @@ def update_project(pid: str, body: ProjectIn):
     p = _read_project(pid)
     spec_changed = body.spec.strip() != p["spec"]
     _apply(p, body)
+    _save_secrets(pid, body)
     if spec_changed or not p.get("operations"):
-        p.update(_load_spec_info(body.spec, _merged_headers(p, "headers")))
+        p.update(_load_spec_info(body.spec, _merged_headers(p, "headers"), _variables(pid)))
     p["updated"] = time.time()
     _write_project(p)
     return {"ok": True}
@@ -508,7 +683,7 @@ def update_project(pid: str, body: ProjectIn):
 @app.post("/api/projects/{pid}/refresh")
 def refresh_project(pid: str):
     p = _read_project(pid)
-    p.update(_load_spec_info(p["spec"], _merged_headers(p, "headers")))
+    p.update(_load_spec_info(p["spec"], _merged_headers(p, "headers"), _variables(pid)))
     _write_project(p)
     return {"operations": len(p["operations"])}
 
@@ -525,6 +700,7 @@ def delete_project(pid: str):
         removed += 1
     _project_file(pid).unlink()
     _secrets.pop(pid, None)
+    store().drop_project(pid)
     return {"deleted_runs": removed}
 
 
@@ -555,9 +731,14 @@ def project_yaml(pid: str):
                  headers_b=hdrs("headers_b"), stages=p.get("stages", ALL_STAGES),
                  max_examples=p.get("max_examples", 50), fail_on=p.get("fail_on", "high"),
                  out_dir=f"reports/{pid}", no_mutating_authz=p.get("no_mutating_authz", False),
-                 exclude_paths=p.get("exclude_paths", []), bola=p.get("bola", []))
+                 exclude_paths=p.get("exclude_paths", []), bola=p.get("bola", []),
+                 login_a=p.get("login_a"), login_b=p.get("login_b"))
     data = asdict(cfg)
-    for k in ("timeout", "zap_image", "types_max_fields", "operations", "cancel", "on_progress", "testlog", "title"):
+    for k in ("login_a", "login_b"):
+        if not data.get(k):
+            data.pop(k, None)
+    for k in ("timeout", "zap_image", "types_max_fields", "operations", "cancel", "on_progress", "testlog", "title",
+              "auth_a", "auth_b", "variables"):  # runtime-only fields; load_config rejects them
         data.pop(k, None)
     return f"# apitest config for project '{p['name']}'\n" + yaml.safe_dump(data, sort_keys=False)
 
@@ -583,6 +764,8 @@ def get_run(run_id: str):
 def cancel_run(run_id: str):
     ev = _cancels.get(run_id)
     st = _runs.get(run_id)
+    if not st and not _load_meta(run_id):
+        raise HTTPException(404, "Run not found")
     if not ev or not st or st["status"] not in ("running", "stopping"):
         raise HTTPException(409, "This run is not running")
     ev.set()
@@ -672,7 +855,7 @@ def run_download(run_id: str, kind: str):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for p in sorted(d.rglob("*")):
-                if p.is_file():
+                if p.is_file() and p.name not in UNMASKED_FILES:
                     z.write(p, f"{base}/{p.relative_to(d).as_posix()}")
             z.writestr(f"{base}/README.txt", ZIP_README)
         return Response(buf.getvalue(), media_type="application/zip",
@@ -721,6 +904,10 @@ def _ensure_artifacts(d: Path, meta: dict) -> None:
     htmlreport.build(d, meta, cov)
 
 
+# Raw tool output that holds real credentials (runs made before it was deleted after use): kept on disk
+# for rebuilding old runs, never served or exported
+UNMASKED_FILES = {"schemathesis-events.ndjson"}
+
 ZIP_README = """apitest run export
 
 test-report.html  Start here: per API, what was tested and what wasn't (and why), the problems found,
@@ -733,7 +920,7 @@ test-log.csv      The same, one row per test without bodies, for Excel.
 report.html       Findings report.        report.json   Findings as JSON.
 run.json          Run settings and status (header values masked).
 spec.json / spec-full.json   The OpenAPI document that was tested.
-schemathesis-*    Raw Schemathesis output (JUnit XML, event stream, console log).
+schemathesis-*    Raw Schemathesis output (JUnit XML, console log).
 zap.html / zap.json / zap.log   Raw OWASP ZAP output.
 types.log         One line per wrong-type request.
 """
@@ -741,9 +928,11 @@ types.log         One line per wrong-type request.
 
 @app.get("/api/runs/{run_id}/files/{name}")
 def run_file(run_id: str, name: str):
-    run_dir = (runs_dir() / run_id).resolve()
-    f = (run_dir / name).resolve()
-    if f.parent != run_dir or not f.is_file() or not run_dir.is_relative_to(runs_dir().resolve()):
+    run_dir = _run_dir(run_id).resolve()  # validates the id before any path is touched
+    if not re.fullmatch(r"[\w-][\w.-]*", name) or name in UNMASKED_FILES:
+        raise HTTPException(404)
+    f = run_dir / name
+    if not f.is_file():
         raise HTTPException(404)
     if f.suffix in (".log", ".xml", ".txt"):
         return PlainTextResponse(f.read_text(encoding="utf-8", errors="replace"))
@@ -751,7 +940,14 @@ def run_file(run_id: str, name: str):
 
 
 def serve(host: str, port: int, data_dir: str = "reports") -> None:
+    import socket
     import uvicorn
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        if s.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "localhost") else host, port)) == 0:
+            raise SystemExit(f"Port {port} is already in use: the apitest UI (or another program) is already "
+                             f"running there. Open http://localhost:{port}, or stop it first (Ctrl+C in the "
+                             f"terminal that started it), or start this one with --port {port + 1}.")
     configure(data_dir)
     print(f"Data directory: {DATA}")
     if host not in ("127.0.0.1", "localhost"):

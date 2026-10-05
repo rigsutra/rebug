@@ -64,10 +64,55 @@ def describe_case(phase: str, mode: str, description: str) -> str:
     return f"{head}: {desc}"
 
 
-def expected_for(mode: str) -> str:
+AUTH_HEADERS = ("authorization", "x-api-key", "api-key", "cookie")
+
+
+def is_method_probe(description: str) -> bool:
+    return "Unspecified HTTP method" in (description or "")
+
+
+def is_auth_probe(description: str) -> bool:
+    """Cases that are *about* credentials (missing/odd Authorization or X-API-Key)."""
+    d = (description or "").lower()
+    return any(h in d for h in AUTH_HEADERS)
+
+
+def expected_for(mode: str, description: str = "") -> str:
+    if is_method_probe(description):
+        m = re.search(r"method: (\w+)", description)
+        return (f"405 Method Not Allowed: this API path doesn't define {m[1] if m else 'this method'}, and the "
+                "standard answer for that is 405.")
     if mode == "negative":
         return "The API should refuse it with a 4xx error, because the request is invalid on purpose."
     return "The API should accept it without crashing and answer exactly as the Swagger describes."
+
+
+def permission_detail(body: str | None) -> str:
+    """'missing permission read:aggregation' from a 403 body like {"required": ["read:aggregation"], ...}."""
+    if not body:
+        return ""
+    try:
+        import json
+        doc = json.loads(body)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        req = doc.get("required") or doc.get("requiredScopes") or doc.get("required_scopes") or doc.get("scopes")
+        if isinstance(req, list) and req:
+            return "missing permission " + ", ".join(f"`{r}`" for r in req)
+    said = server_said(body)
+    return f"server said: {said}" if said else ""
+
+
+def blocked_by_auth(status, mode: str, description: str, has_credentials: bool) -> str:
+    """If a request that wasn't about credentials was refused for auth reasons, explain why it
+    therefore didn't test anything. Empty string otherwise."""
+    if status not in (401, 403) or not has_credentials or is_auth_probe(description) or is_method_probe(description):
+        return ""
+    what = "the invalid input was never checked" if mode == "negative" else "the API's logic was never reached"
+    if status == 403:
+        return f"Not really tested: refused with HTTP 403 Forbidden before anything else, so {what}."
+    return f"Not really tested: refused with HTTP 401 (login not accepted), so {what}."
 
 
 CHECKS = {

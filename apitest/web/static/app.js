@@ -233,6 +233,236 @@ function groupOps(ops) {
   return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
+/* ---------- test users: paste headers, or log in automatically ---------- */
+
+function userAuthHtml(k, title, who, headers, login) {
+  const L = login || {};
+  const auto = !!(login && login.url);
+  const n = (x) => `${k}_${x}`;
+  const sel = (name, opts, cur) => `<select name="${n(name)}">${opts.map(([v, l]) =>
+    `<option value="${v}" ${v === cur ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+  return `<fieldset class="user-auth" data-user="${k}">
+    <legend>${esc(title)} <small>${esc(who)}</small></legend>
+    <div class="seg">
+      <label><input type="radio" name="${n("mode")}" value="paste" ${auto ? "" : "checked"}> Paste a token / headers</label>
+      <label><input type="radio" name="${n("mode")}" value="login" ${auto ? "checked" : ""}> Log in automatically</label>
+    </div>
+    <div data-mode="paste" ${auto ? "hidden" : ""}>
+      <label class="field">Headers <small>one <code>Name: value</code> per line</small>
+        <textarea name="${k === "a" ? "headers" : "headers_b"}" rows="2" placeholder="Authorization: Bearer \${TOKEN_${k.toUpperCase()}}">${esc(headers)}</textarea></label>
+    </div>
+    <div data-mode="login" ${auto ? "" : "hidden"}>
+      <div class="grid-login">
+        <label class="field">Method ${sel("method", [["POST", "POST"], ["GET", "GET"], ["PUT", "PUT"]], L.method || "POST")}</label>
+        <label class="field">Login API URL <input name="${n("url")}" value="${esc(L.url || "")}" placeholder="https://auth.example.com/api/auth/login"></label>
+      </div>
+      <label class="field">Request body <small>write the password as a name like <code>\${NTT_PASSWORD}</code>; its value goes in Secrets below</small>
+        <textarea name="${n("body")}" rows="3" placeholder='{"email": "qa-user@example.com", "password": "\${QA_PASSWORD}"}'>${esc(L.body || "")}</textarea></label>
+      <div class="grid2">
+        <label class="field">Body format ${sel("body_type", [["json", "JSON"], ["form", "Form (a=1&b=2)"], ["raw", "Raw text"]], L.body_type || "json")}</label>
+        <label class="field">Extra login headers <small>optional, one per line</small>
+          <textarea name="${n("lheaders")}" rows="1" placeholder="X-Tenant-Id: 42">${esc(Object.entries(L.headers || {}).map(([a, b]) => `${a}: ${b}`).join("\n"))}</textarea></label>
+      </div>
+      <details class="box" ${auto ? "" : "open"}><summary>Pick the token from a sample response</summary>
+        <p class="hint">Paste one login response here and click the field that holds the token. The sample stays in your browser; it's never sent or saved.</p>
+        <textarea data-sample="${k}" rows="4" placeholder='{"success": true, "data": {"accessToken": "eyJ…"}}'></textarea>
+        <div data-fields="${k}" class="fields"></div>
+      </details>
+      <div class="grid2">
+        <label class="field">Token is at <small>path in the response</small>
+          <input name="${n("token_path")}" value="${esc(L.token_path || "")}" placeholder="data.accessToken"></label>
+        <label class="field">Send the token as ${sel("token_type", [["bearer", "Bearer token (Authorization: Bearer …)"], ["header", "Custom header"], ["cookie", "Cookie"]], L.token_type || "bearer")}</label>
+      </div>
+      <div class="grid2" data-show="${k}-tokname">
+        <label class="field" data-for="header">Header name <input name="${n("header_name")}" value="${esc(L.header_name && L.header_name !== "Authorization" ? L.header_name : "")}" placeholder="X-API-Key"></label>
+        <label class="field" data-for="cookie">Cookie name <input name="${n("cookie_name")}" value="${esc(L.cookie_name || "")}" placeholder="session"></label>
+      </div>
+      <div class="grid2">
+        <label class="field">Token expires ${sel("expiry", [["jwt", "Automatically, from the token (JWT exp)"], ["field", "From a field in the response"], ["fixed", "After a fixed time"]], L.expiry || "jwt")}</label>
+        <label class="field" data-exp="field">Expiry field <small>seconds, or a date/time</small>
+          <input name="${n("expiry_path")}" value="${esc(L.expiry_path || "")}" placeholder="data.expiresIn"></label>
+        <label class="field" data-exp="fixed">Minutes <input type="number" min="1" name="${n("fixed_minutes")}" value="${L.fixed_minutes || 15}"></label>
+      </div>
+    </div>
+    <div class="vars" data-vars="${k}"></div>
+    <div data-mode="login" ${auto ? "" : "hidden"}>
+      <div class="login-test"><button type="button" class="secondary small" data-act="testlogin">Test login</button>
+        <span data-out="loginres"></span></div>
+      <p class="hint">apitest logs in when a run starts and fetches a new token 30 seconds before the current one expires.</p>
+    </div>
+  </fieldset>`;
+}
+
+function readLogin(form, k) {
+  const v = (x) => form.elements[`${k}_${x}`]?.value ?? "";
+  if ((form.querySelector(`input[name=${k}_mode]:checked`) || {}).value !== "login") return null;
+  const headers = {};
+  v("lheaders").split("\n").forEach((line) => { const i = line.indexOf(":"); if (i > 0) headers[line.slice(0, i).trim()] = line.slice(i + 1).trim(); });
+  const type = v("token_type");
+  return {
+    url: v("url").trim(), method: v("method"), body: v("body"), body_type: v("body_type"), headers,
+    token_path: v("token_path").trim(), token_type: type,
+    header_name: type === "header" ? (v("header_name").trim() || "Authorization") : "Authorization",
+    cookie_name: type === "cookie" ? v("cookie_name").trim() : "",
+    expiry: v("expiry"), expiry_path: v("expiry_path").trim(), fixed_minutes: parseInt(v("fixed_minutes"), 10) || 15,
+  };
+}
+
+function jwtInfo(s) {
+  if (typeof s !== "string" || !/^eyJ[\w-]+\.[\w-]+\.[\w-]*$/.test(s)) return null;
+  try {
+    const c = JSON.parse(atob(s.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return c;
+  } catch { return null; }
+}
+
+function leafPaths(o, prefix = "", out = []) {
+  if (o && typeof o === "object") {
+    if (Array.isArray(o)) o.slice(0, 20).forEach((v, i) => leafPaths(v, `${prefix}[${i}]`, out));
+    else Object.entries(o).forEach(([k, v]) => leafPaths(v, prefix ? `${prefix}.${k}` : k, out));
+  } else out.push([prefix, o]);
+  return out;
+}
+
+function setupLogin(form, k, pid, pendingSecrets) {
+  const box = form.querySelector(`fieldset[data-user=${k}]`);
+  const el = (x) => form.elements[`${k}_${x}`];
+  const sync = () => {
+    const mode = (box.querySelector(`input[name=${k}_mode]:checked`) || {}).value;
+    box.querySelectorAll("[data-mode=paste]").forEach((d) => (d.hidden = mode !== "paste"));
+    box.querySelectorAll("[data-mode=login]").forEach((d) => (d.hidden = mode !== "login"));
+    const tt = el("token_type").value;
+    box.querySelector("[data-for=header]").hidden = tt !== "header";
+    box.querySelector("[data-for=cookie]").hidden = tt !== "cookie";
+    box.querySelector(`[data-show=${k}-tokname]`).hidden = tt === "bearer";
+    const ex = el("expiry").value;
+    box.querySelector("[data-exp=field]").hidden = ex !== "field";
+    box.querySelector("[data-exp=fixed]").hidden = ex !== "fixed";
+  };
+  box.addEventListener("change", sync);
+  sync();
+
+  /* ${NAME} values: project secrets, stored encrypted by apitest and never shown again */
+  const varsBox = box.querySelector(`[data-vars=${k}]`);
+  const usedNames = () => {
+    const mode = (box.querySelector(`input[name=${k}_mode]:checked`) || {}).value;
+    const texts = mode === "login" ? [el("url").value, el("body").value, el("lheaders").value]
+      : [form.elements[k === "a" ? "headers" : "headers_b"].value];
+    const names = [];
+    texts.forEach((t) => [...(t || "").matchAll(/\$\{(\w+)\}/g)].forEach((m) => names.includes(m[1]) || names.push(m[1])));
+    return names;
+  };
+  let varsKey = null;
+  const drawVars = async (force = false) => {
+    const names = usedNames();
+    const key = names.join(",");
+    if (!force && key === varsKey) return;
+    varsKey = key;
+    if (!names.length) { varsBox.innerHTML = ""; return; }
+    let st = [];
+    try { st = await api(`/api/vars?${new URLSearchParams({ names: key, project: pid })}`); }
+    catch (e) { varsBox.innerHTML = `<p class="error">${esc(e.message)}</p>`; return; }
+    const label = (v) => v.error ? [esc(v.error), "error"]
+      : pendingSecrets[v.name] ? ["● will be saved when you create the project", "muted"]
+      : v.source === "project" ? ["✓ saved in this project (encrypted)", "ok-text"]
+      : v.source === "environment" ? ["✓ taken from the server's environment variable", "ok-text"]
+      : ["✕ no value yet", "error"];
+    varsBox.innerHTML = `<h4>Secrets</h4>
+      <p class="hint">Enter the value for each name used above. It's stored encrypted with this project and never shown again;
+        it isn't included in exports, reports or logs.</p>
+      <table class="vars-t">${st.map((v) => {
+        const [text, cls] = label(v);
+        const has = v.source === "project" || pendingSecrets[v.name];
+        return `<tr data-var="${esc(v.name)}">
+        <td><code>\${${esc(v.name)}}</code></td><td class="vs ${cls}">${text}</td>
+        <td><input type="password" autocomplete="new-password" placeholder="${has ? "type a new value to replace it" : "value"}" ${v.error ? "disabled" : ""}></td>
+        <td class="nowrap"><button type="button" class="primary small" data-setvar ${v.error ? "disabled" : ""}>${pid ? "Save" : "Keep"}</button>
+          ${has ? `<button type="button" class="secondary small" data-clearvar>Remove</button>` : ""}</td></tr>`;
+      }).join("")}</table>`;
+  };
+  ["url", "body", "lheaders"].forEach((x) => el(x)?.addEventListener("input", () => drawVars()));
+  form.elements[k === "a" ? "headers" : "headers_b"].addEventListener("input", () => drawVars());
+  box.addEventListener("change", (e) => { if (e.target.name === `${k}_mode`) drawVars(); });
+  varsBox.addEventListener("click", async (e) => {
+    const tr = e.target.closest("tr[data-var]");
+    if (!tr) return;
+    const name = tr.dataset.var;
+    try {
+      if (e.target.closest("[data-setvar]")) {
+        const input = $("input[type=password]", tr);
+        if (!input.value) return toast("Type the value first", true);
+        if (pid) {
+          await api(`/api/projects/${encodeURIComponent(pid)}/secrets/${encodeURIComponent(name)}`,
+            { method: "PUT", body: JSON.stringify({ value: input.value }) });
+          toast(`${name} saved (encrypted)`);
+        } else {
+          pendingSecrets[name] = input.value;  // new project: saved with "Create project"
+          toast(`${name} will be saved when you create the project`);
+        }
+        input.value = "";
+      } else if (e.target.closest("[data-clearvar]")) {
+        if (pid) {
+          await api(`/api/projects/${encodeURIComponent(pid)}/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
+        }
+        delete pendingSecrets[name];
+        toast(`${name} removed`);
+      } else return;
+      drawVars(true);
+    } catch (err) { toast(err.message, true); }
+  });
+  varsBox.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.type === "password") { e.preventDefault(); e.target.closest("tr").querySelector("[data-setvar]").click(); }
+  });
+  drawVars();
+
+  const sample = box.querySelector(`[data-sample=${k}]`);
+  const fields = box.querySelector(`[data-fields=${k}]`);
+  sample.addEventListener("input", () => {
+    let doc;
+    try { doc = JSON.parse(sample.value); } catch { fields.innerHTML = sample.value.trim() ? `<p class="error">That isn't valid JSON yet.</p>` : ""; return; }
+    const rows = leafPaths(doc);
+    const now = Date.now() / 1000;
+    fields.innerHTML = `<table class="pick">${rows.map(([path, val]) => {
+      const j = jwtInfo(val);
+      const looksExp = /exp|expire|ttl|valid/i.test(path) && (typeof val === "number" || /^\d+$|^\d{4}-\d\d-\d\d/.test(String(val)));
+      const preview = j ? `JWT${j.exp ? ` · expires ${j.exp > now ? `in ${Math.round((j.exp - now) / 60)} min` : `${Math.round((now - j.exp) / 60)} min ago`}` : " · no exp"}${j.type ? ` · type ${esc(j.type)}` : ""}`
+        : typeof val === "string" ? (val.length > 40 ? `“${esc(val.slice(0, 12))}…” (${val.length} chars)` : `“${esc(val)}”`) : esc(String(val));
+      return `<tr><td><code>${esc(path)}</code></td><td class="muted">${preview}</td><td class="act">
+        ${typeof val === "string" && val.length >= 16 ? `<button type="button" class="${j && j.type !== "refresh" ? "primary" : "secondary"} small" data-pick="${esc(path)}">Use as token</button>` : ""}
+        ${looksExp ? `<button type="button" class="secondary small" data-pickexp="${esc(path)}">Use as expiry</button>` : ""}</td></tr>`;
+    }).join("")}</table>`;
+  });
+  fields.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-pick],[data-pickexp]");
+    if (!b) return;
+    if (b.dataset.pick) {
+      el("token_path").value = b.dataset.pick;
+      const val = leafPaths(JSON.parse(sample.value)).find(([p]) => p === b.dataset.pick)?.[1];
+      if (jwtInfo(val)?.exp) el("expiry").value = "jwt";
+      toast(`Token path set to ${b.dataset.pick}`);
+    } else {
+      el("expiry").value = "field";
+      el("expiry_path").value = b.dataset.pickexp;
+      toast(`Expiry read from ${b.dataset.pickexp}`);
+    }
+    sync();
+  });
+
+  const res = box.querySelector("[data-out=loginres]");
+  box.querySelector("[data-act=testlogin]").addEventListener("click", async () => {
+    const login = readLogin(form, k);
+    res.className = "muted"; res.textContent = "Logging in…";
+    try {
+      const r = await post("/api/login/test", { login, project_id: pid, secrets: pendingSecrets });
+      const at = new Date(r.expires_at * 1000).toLocaleTimeString();
+      const ref = new Date(r.refresh_at * 1000).toLocaleTimeString();
+      res.className = "ok-text";
+      res.textContent = `✓ Logged in (${r.header}: ${r.token_preview}). Token expires at ${at}, in ${Math.round(r.expires_in / 60)} min ` +
+        `(from ${r.expiry_source}); apitest would renew it at ${ref}.`;
+    } catch (e) { res.className = "error"; res.textContent = e.message; }
+  });
+}
+
 /**
  * Renders the project form into `root`. `project` = null for a new project.
  * onSaved(id) is called after a successful save.
@@ -269,14 +499,10 @@ function renderProjectForm(root, project, onSaved) {
 
     <section class="panel">
       <h2 class="step"><span class="step-n">3</span> Test users</h2>
-      <div class="grid2">
-        <label class="field">User A headers <small>one <code>Name: value</code> per line</small>
-          <textarea name="headers" rows="2" placeholder="Authorization: Bearer \${ORDERS_TOKEN_A}">${esc(p.headers)}</textarea></label>
-        <label class="field">User B headers <small>a second, ordinary user (BOLA tests)</small>
-          <textarea name="headers_b" rows="2" placeholder="Authorization: Bearer \${ORDERS_TOKEN_B}">${esc(p.headers_b)}</textarea></label>
-      </div>
-      <p class="hint">Write <code>\${ENV_VAR}</code> to reference an environment variable of the apitest server; those lines are saved with the project.
-        A literal token is kept in server memory only, so you re-enter it after a restart. Tokens are never written to disk.</p>
+      ${userAuthHtml("a", "User A", "the main test user", p.headers, p.login_a)}
+      ${userAuthHtml("b", "User B", "a second, ordinary user from another organisation, for cross-user (BOLA) checks", p.headers_b, p.login_b)}
+      <p class="hint">Write a name like <code>\${NTT_PASSWORD}</code> wherever a password, API key or token goes, then enter its value in the
+        <b>Secrets</b> box that appears. Values are stored encrypted with this project.</p>
       <details class="box"><summary>Cross-user (BOLA) scenarios <span class="count" data-out="bolaCount">${p.bola.length}</span></summary>
         <p class="hint">Resources owned by <b>user A</b>. The tester checks A can access them, then replays the request as user B and flags any success.</p>
         <div data-out="bola"></div><datalist id="opPaths"></datalist>
@@ -308,6 +534,9 @@ function renderProjectForm(root, project, onSaved) {
 
   const form = $("form", root);
   const f = (n) => form.elements[n];
+  const pendingSecrets = {};  // typed in a new project's form; saved (encrypted) when it's created
+  setupLogin(form, "a", project?.id || "", pendingSecrets);
+  setupLogin(form, "b", project?.id || "", pendingSecrets);
   const bolaBox = $("[data-out=bola]", root);
   const setOpPaths = () => {
     $("#opPaths").innerHTML = [...new Set(ops.filter((o) => o.path_params.length).map((o) => o.path))].map((x) => `<option value="${esc(x)}">`).join("");
@@ -327,7 +556,7 @@ function renderProjectForm(root, project, onSaved) {
     try {
       const res = await post("/api/discover", { url, headers: f("headers").value });
       if (!res.specs.length) {
-        out.innerHTML = `<p class="error">No Swagger/OpenAPI document found (${res.tried} locations tried).</p>
+        out.innerHTML = `<p class="error">${esc(res.message)}</p>
           <p class="hint">Check the app is running and reachable from this machine. If the spec lives somewhere unusual, paste its exact URL.
           If the spec itself needs a token, fill in User A headers (step 3) first and discover again.</p>`;
         return;
@@ -371,6 +600,8 @@ function renderProjectForm(root, project, onSaved) {
       no_mutating_authz: f("no_mutating_authz").checked,
       exclude_paths: f("exclude_paths").value.split("\n").map((s) => s.trim()).filter(Boolean),
       bola: readBola(bolaBox),
+      login_a: readLogin(form, "a"), login_b: readLogin(form, "b"),
+      secrets: pendingSecrets,
     };
     if (!body.spec) { err.textContent = "Pick or enter a spec URL (step 1)."; err.hidden = false; return; }
     if (!body.stages.length) { err.textContent = "Select at least one test."; err.hidden = false; return; }

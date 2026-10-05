@@ -1,0 +1,23 @@
+# Demo config using automatic login instead of fixed tokens.
+# The passwords come from environment variables, e.g. in PowerShell:
+#   $env:DEMO_ALICE_PW = "alice-pass"; $env:DEMO_BOB_PW = "bob-pass"
+# (demo credentials only; see examples/demo_api.py)
+spec: http://localhost:8000/openapi.json
+base_url: http://localhost:8000
+login_a:
+  url: http://localhost:8000/auth/login
+  method: POST
+  body: '{"email": "alice@demo.test", "password": "${DEMO_ALICE_PW}"}'
+  token_path: data.accessToken   # where the token is in the login response
+  token_type: bearer             # bearer | header (+ header_name) | cookie (+ cookie_name)
+  expiry: jwt                    # jwt (read the token's exp) | field (+ expiry_path) | fixed (+ fixed_minutes)
+login_b:
+  url: http://localhost:8000/auth/login
+  body: '{"email": "bob@demo.test", "password": "${DEMO_BOB_PW}"}'
+  token_path: data.accessToken
+max_examples: 30
+out_dir: reports/demo-login
+bola:
+  - method: GET
+    path: /users/{uid}/orders/{oid}
+    params: {uid: 1, oid: 10}
