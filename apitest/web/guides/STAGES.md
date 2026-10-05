@@ -127,6 +127,34 @@ aggressive traffic of the five, so run it against staging only.
 
 ---
 
+## Severity, root causes and access issues
+
+Every failed test gets a root cause, a severity and a recommended fix. The HTML report starts with
+**Fix these first**: problems grouped by root cause, the 10 APIs with the most failed tests, every
+API that crashes with a 5xx, and every API that accepts wrong data types.
+
+| Root cause | Severity |
+|---|---|
+| Works without a valid login, one user reads another's data (BOLA) | critical |
+| Server error (5xx) from any input, CORS `*` with credentials, missing required header not rejected | high |
+| Wrong type accepted (e.g. `"1"` for a number), null accepted on a required field, invalid input accepted, response doesn't match the schema, leaked stack traces | medium |
+| Undocumented status code or Content-Type, unsupported method not answered with 405, missing security header, null accepted on an optional field | low |
+| Swagger rule problems (`lint`) and ZAP alerts | the tool's own rating |
+
+When requests that should reach an API's logic are refused with 401/403, that API is marked
+**Not tested: access issue** (every such request refused) or **Partly not tested: access issue**
+(some refused), with the reason: no token, a refused token, or the missing permission. Requests
+that test the login itself (no token, fake token) don't count.
+
+### When the Swagger isn't reliable: lenient mode
+
+Turn on *The Swagger isn't reliable (lenient mode)* in the project's Settings, or pass
+`--lenient-spec` on the CLI (`lenient_spec: true` in a config file). Findings that only show the
+API and the Swagger disagree (undocumented status codes, response shape, Content-Type, validation
+rules the Swagger declares) are listed as **Swagger problems** with severity info, so they don't
+fail the run. Crashes, wrong types accepted, missing login checks, BOLA and ZAP alerts are still
+reported at their normal severity.
+
 ## What none of the stages checks
 
 - **Business rules**, e.g. "a discount can't exceed 50%" or "only managers can approve".

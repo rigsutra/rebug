@@ -325,7 +325,8 @@ def test_write_json_and_csv(tmp_path):
     assert raw.startswith(b"\xef\xbb\xbf")
     rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
     assert [r["test"] for r in rows] == ["Login required", "Swagger quality"]  # API without tests: no rows
-    assert rows[0] == {"api": "GET /a", "overall": "incomplete", "test": "Login required", "status": "not_tested",
+    assert rows[0] == {"api": "GET /a", "overall": "incomplete", "access": "ok", "test": "Login required",
+                       "status": "not_tested",
                        "requests": "0", "failed": "0", "reason": 'No request, "quoted", with, commas\nand ✓'}
     assert rows[1]["requests"] == "3" and rows[1]["failed"] == "1"
 

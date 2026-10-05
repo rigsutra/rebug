@@ -89,7 +89,14 @@ const GUIDE_HTML = `<div class="guide">
   <ul class="tight">
     <li>The run fails if any finding reaches the project's fail threshold.</li>
     <li>Download the HTML report or request log from the run page. <b>CLI config</b> gives a YAML file for CI.</li>
-    <li>"Not really tested" means the server answered 401/403, so the check never got through.</li>
+    <li>"Not really tested" means the server answered 401/403, so the check never got through. APIs where that
+      happened are marked <b>Not tested: access issue</b> (every request refused) or <b>Partly not tested: access issue</b>.</li>
+    <li>The HTML report opens with <b>Fix these first</b>: problems grouped by root cause with a recommended fix,
+      the 10 APIs with most failed tests, every API that crashes (5xx), and every API that accepts wrong data types.
+      Every failed test has a severity, e.g. a 5xx is high and a coerced <code>"1"</code> for a number is medium.</li>
+    <li><b>Swagger not reliable?</b> Tick <i>lenient mode</i> in Settings → Tests → Advanced. Crashes, wrong types,
+      missing login checks and security alerts are still reported. Mismatches with the Swagger become
+      <b>Swagger problems</b> (info), so they don't bury the real bugs or fail the run.</li>
   </ul>
   <p class="hint">What each finding usually means and how to fix it is in section 6 of the Swagger guide.
     <a href="/guides/STAGES.md" download>Download the full stage reference</a>.</p>

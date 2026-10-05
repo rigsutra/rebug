@@ -267,6 +267,15 @@ table.kv td { padding: 2px 0; font-family: ui-monospace, monospace; overflow-wra
 .finding .stage-tag { font-size: 11px; color: var(--muted); margin-left: 6px; }
 .finding pre { margin: 0 4px 12px 90px; padding: 10px; background: var(--panel-2); border-radius: 6px; white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; }
 .sev { font: 700 11px ui-monospace, monospace; text-transform: uppercase; }
+.finding .fix { font-size: 12.5px; color: var(--muted); margin-top: 3px; font-weight: 400; }
+.finding .fix b, .entry .fix b { color: var(--ok); }
+.stage-tag.spec { background: var(--code); border-radius: 8px; padding: 0 6px; }
+table.log .sv { width: 72px; }
+.access-box { border-left: 3px solid var(--medium); }
+.access-tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.access-tbl td { padding: 6px 8px; border-top: 1px solid var(--border); vertical-align: top; }
+.access-tbl td.op { width: 260px; overflow-wrap: anywhere; } .access-tbl td.op code { background: none; padding: 0; }
+.a-blocked { color: var(--high); white-space: nowrap; } .a-partial { color: var(--medium); white-space: nowrap; }
 .none { color: var(--muted); padding: 20px 4px; }
 .files { margin-top: 18px; font-size: 12.5px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 

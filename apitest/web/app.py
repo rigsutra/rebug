@@ -40,7 +40,7 @@ from .. import coverage as coverage_mod
 from ..secretstore import SecretStore
 from ..secretstore import check_name as check_secret_name
 from ..auth import REFRESH_MARGIN, LoginConfig, LoginError, TokenProvider, jwt_claims, literal_secrets
-from .. import htmlreport
+from .. import htmlreport, triage
 from ..stages.conformance import log_scenarios
 from ..testlog import TestLog, iter_entries, write_csv
 
@@ -99,6 +99,7 @@ class ProjectIn(BaseModel):
     max_examples: int = 50
     fail_on: str = "high"
     no_mutating_authz: bool = False
+    lenient_spec: bool = False  # the Swagger isn't reliable; see Config.lenient_spec
     exclude_paths: list[str] = Field(default_factory=list)
     bola: list[BolaIn] = Field(default_factory=list)
     login_a: dict | None = None  # automatic login (auth.LoginConfig fields); secrets as ${VAR}
@@ -466,6 +467,7 @@ def _start(p: dict, operations: list[str], force: bool = False, stages: list[str
         stages=stages, max_examples=p.get("max_examples", 50),
         fail_on=p.get("fail_on", "high"), out_dir=str(runs_dir() / run_id),
         no_mutating_authz=p.get("no_mutating_authz", False), exclude_paths=p.get("exclude_paths", []),
+        lenient_spec=p.get("lenient_spec", False),
         bola=p.get("bola", []), operations=operations, cancel=cancel, title=p["name"], variables=variables,
         login_a=p.get("login_a"), login_b=p.get("login_b"),
         auth_a=providers.get("login_a"), auth_b=providers.get("login_b"),
@@ -482,6 +484,7 @@ def _start(p: dict, operations: list[str], force: bool = False, stages: list[str
         "headers_b": _mask(headers_b) or ({"login": "automatic"} if "login_b" in providers else {}),
         "spec_info": None,
         "activity": None, "feed": [], "exclude_paths": cfg.exclude_paths, "bola": cfg.bola,
+        "lenient_spec": cfg.lenient_spec,
     }
     _runs[run_id] = state
     _cancels[run_id] = cancel
@@ -766,6 +769,7 @@ def project_yaml(pid: str):
                  headers_b=hdrs("headers_b"), stages=p.get("stages", ALL_STAGES),
                  max_examples=p.get("max_examples", 50), fail_on=p.get("fail_on", "high"),
                  out_dir=f"reports/{pid}", no_mutating_authz=p.get("no_mutating_authz", False),
+                 lenient_spec=p.get("lenient_spec", False),
                  exclude_paths=p.get("exclude_paths", []), bola=p.get("bola", []),
                  login_a=p.get("login_a"), login_b=p.get("login_b"))
     data = asdict(cfg)
@@ -788,7 +792,8 @@ def get_run(run_id: str):
     with _lock:
         data = json.loads(json.dumps(_meta_public(meta)))
     data["feed"] = (data.get("feed") or [])[-150:]
-    data["report"] = _report(run_id)
+    data["report"] = triage.enrich_report(_report(run_id))
+    data["access"] = _access_issues(run_id)
     d = runs_dir() / run_id
     data["files"] = sorted(x.name for x in d.iterdir() if x.is_file() and x.name != "run.json"
                            and not x.name.startswith(".")) if d.is_dir() else []
@@ -814,11 +819,27 @@ def _run_dir(run_id: str) -> Path:
     return runs_dir() / run_id
 
 
-def _summary(e: dict) -> dict:
+def _access_issues(run_id: str) -> list[dict]:
+    """APIs whose tests were stopped by 401/403, from the run's coverage (written when the run finishes)."""
+    f = runs_dir() / run_id / "coverage.json"
+    try:
+        cov = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
+    except ValueError:
+        return []
+    return [{"operation": a["operation"], **a["access"]} for a in cov.get("apis", [])
+            if (a.get("access") or {}).get("status") in ("blocked", "partial")]
+
+
+def _lenient(run_id: str) -> bool:
+    return bool((_load_meta(run_id) or {}).get("lenient_spec"))
+
+
+def _summary(e: dict, lenient: bool = False) -> dict:
     """Test-log entry without bodies/headers, for the list view."""
     rq, rs = e.get("request") or {}, e.get("response") or {}
     d = e.get("details") or {}
-    return {"seq": e["seq"], "ts": e["ts"], "stage": e["stage"], "operation": e["operation"],
+    t = triage.triage_entry(e, lenient)
+    return {"seq": e["seq"], "severity": t.get("severity"), "cause": t.get("cause"), "spec_issue": t.get("spec_issue"), "ts": e["ts"], "stage": e["stage"], "operation": e["operation"],
             "scenario": e["scenario"], "expected": e["expected"], "verdict": e["verdict"],
             "explanation": (e.get("explanation") or "")[:300],
             "method": rq.get("method", ""), "url": rq.get("url", ""), "status": rs.get("status"),
@@ -834,6 +855,7 @@ def run_log(run_id: str, stage: str = "", op: str = "", verdict: str = "", q: st
     ignores the stage filter so the stage tabs keep their numbers)."""
     f = _run_dir(run_id) / "test-log.ndjson"
     q = q.lower()
+    lenient = _lenient(run_id)
     items, total, verdicts, stages, ops = [], 0, {}, {}, set()
     for e in iter_entries(f):
         if op and e["operation"] != op and not (op == "-" and not e["operation"]):
@@ -848,7 +870,7 @@ def run_log(run_id: str, stage: str = "", op: str = "", verdict: str = "", q: st
         ops.add(e["operation"])
         verdicts[e["verdict"]] = verdicts.get(e["verdict"], 0) + 1
         if offset <= total < offset + limit:
-            items.append(_summary(e))
+            items.append(_summary(e, lenient))
         total += 1
     return {"total": total, "items": items, "verdicts": verdicts, "stages": stages,
             "operations": sorted(o for o in ops if o), "available": f.is_file()}
@@ -858,7 +880,7 @@ def run_log(run_id: str, stage: str = "", op: str = "", verdict: str = "", q: st
 def run_log_entry(run_id: str, seq: int):
     for e in iter_entries(_run_dir(run_id) / "test-log.ndjson"):
         if e["seq"] == seq:
-            return e
+            return {**e, "triage": triage.triage_entry(e, _lenient(run_id))}
     raise HTTPException(404)
 
 

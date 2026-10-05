@@ -11,9 +11,10 @@ from .models import SEVERITIES, StageResult, sev_rank
 COLORS = {"critical": "#b91c1c", "high": "#dc2626", "medium": "#d97706", "low": "#2563eb", "info": "#6b7280"}
 
 
-def write_reports(out: Path, spec_src: str, base: str, results: list[StageResult]) -> None:
+def write_reports(out: Path, spec_src: str, base: str, results: list[StageResult], lenient: bool = False) -> None:
     (out / "report.json").write_text(
-        json.dumps({"spec": spec_src, "base_url": base, "stages": [asdict(r) for r in results]}, indent=2),
+        json.dumps({"spec": spec_src, "base_url": base, "lenient_spec": lenient,
+                    "stages": [asdict(r) for r in results]}, indent=2),
         encoding="utf-8")
     e = html.escape
     counts = {s: 0 for s in SEVERITIES}

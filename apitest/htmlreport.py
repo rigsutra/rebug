@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from . import triage
 from .explain import PHASES, STAGES, finding_title
 from .testlog import iter_entries
 
@@ -22,12 +23,16 @@ def _cut(s):
 
 def build(run_dir: Path, meta: dict, coverage: dict) -> Path:
     report = json.loads((run_dir / "report.json").read_text(encoding="utf-8")) if (run_dir / "report.json").is_file() else {"stages": []}
-    tests = defaultdict(list)
+    lenient = bool(report.get("lenient_spec") or meta.get("lenient_spec"))
+    tests, raw = defaultdict(list), defaultdict(list)
     for e in iter_entries(run_dir / "test-log.ndjson"):
         rq, rs = e.get("request") or {}, e.get("response") or {}
+        t = triage.triage_entry(e, lenient)
+        raw[e.get("operation") or ""].append(e)
         tests[e.get("operation") or ""].append({
             "seq": e["seq"], "stage": e["stage"], "scenario": e["scenario"], "expected": e.get("expected", ""),
             "verdict": e["verdict"], "explanation": e.get("explanation", ""),
+            "sev": t.get("severity"), "cause": triage.CAUSES[t["cause"]].title if t else "", "fix": t.get("fix", ""),
             "req": {"method": rq.get("method", ""), "url": rq.get("url", ""), "headers": rq.get("headers") or {},
                     "body": _cut(rq.get("body"))} if rq else None,
             "res": {"status": rs.get("status"), "headers": rs.get("headers") or {}, "body": _cut(rs.get("body")),
@@ -41,12 +46,14 @@ def build(run_dir: Path, meta: dict, coverage: dict) -> Path:
     for key in [k for k in tests if k and k not in known]:
         target = by_path.get(key.split(" ", 1)[-1], "")
         tests[target].extend(tests.pop(key))
+        raw[target].extend(raw.pop(key))
     findings = defaultdict(list)
-    for s in report.get("stages", []):
+    for s in triage.enrich_report(report).get("stages", []):
         for f in s.get("findings", []):
             findings[f.get("operation") or ""].append({"stage": s["name"], "severity": f["severity"],
                                                        "title": finding_title(f["title"]),
-                                                       "detail": (f.get("detail") or "")[:1500]})
+                                                       "detail": (f.get("detail") or "")[:1500],
+                                                       "fix": f.get("fix", ""), "spec_issue": f.get("spec_issue")})
     stage_status = {s["name"]: {"status": s["status"], "note": s.get("note", ""), "findings": len(s["findings"]),
                                 "duration": s.get("duration", 0)} for s in report.get("stages", [])}
     data = {
@@ -55,7 +62,8 @@ def build(run_dir: Path, meta: dict, coverage: dict) -> Path:
                 "status": meta.get("status", ""), "started": meta.get("started"), "finished": meta.get("finished"),
                 "selected": meta.get("operations") or [], "stages": stage_status,
                 "user_a": bool(meta.get("headers")), "user_b": bool(meta.get("headers_b")),
-                "generated": time.time()},
+                "lenient": lenient, "generated": time.time()},
+        "summary": triage.summarize(raw, lenient),
         "warnings": coverage.get("warnings", []),
         "apis": coverage.get("apis", []),
         "tests": tests, "findings": findings,
@@ -97,6 +105,12 @@ td{padding:7px 8px;border-bottom:1px solid var(--border);vertical-align:top}
 .b-ok,.s-tested,.v-pass{color:var(--ok)}.b-problems,.v-fail{color:var(--bad)}.b-incomplete,.s-partial,.v-error{color:var(--warn)}
 .b-excluded,.s-not_applicable,.s-not_recorded,.v-info{color:var(--info)}.s-not_tested{color:var(--bad)}
 .sev-critical{color:var(--crit)}.sev-high{color:var(--bad)}.sev-medium{color:var(--warn)}.sev-low{color:var(--low)}.sev-info{color:var(--info)}
+.sevb{display:inline-block;min-width:64px;text-align:center;font:700 10.5px system-ui,sans-serif;text-transform:uppercase;letter-spacing:.03em;padding:2px 7px;border-radius:10px;border:1px solid currentColor}
+.fix{margin-top:4px;font-size:12.5px}.fix b{color:var(--ok)}.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:9px;background:var(--code);color:var(--muted);margin-left:6px;font-weight:600}
+.access{border-left:4px solid var(--warn);padding:8px 12px;background:var(--panel2);border-radius:4px;margin:8px 0;font-size:13px}
+.access.blocked{border-left-color:var(--bad)}.a-blocked{color:var(--bad)}.a-partial{color:var(--warn)}
+.prio h3{margin-top:22px}.prio h3:first-child{margin-top:0}.prio td.n{text-align:right;width:1%;white-space:nowrap}
+.apis-list a{white-space:nowrap}.apis-list span{color:var(--muted)}
 .dots span{display:inline-block;width:22px;text-align:center;font-weight:700}
 .api{scroll-margin-top:12px}.api-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.api-head .p{font:600 15px ui-monospace,monospace;overflow-wrap:anywhere}
 .filters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}.filters button{font:inherit;font-size:12.5px;padding:3px 10px;border-radius:12px;border:1px solid var(--border);background:var(--panel2);color:var(--text);cursor:pointer}
@@ -112,7 +126,7 @@ details>summary{cursor:pointer;font-weight:600}.legend dt{font-weight:700;margin
 const D = JSON.parse(document.getElementById("data").textContent);
 const E = (tag, attrs = {}, ...kids) => { const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) { if (k === "class") el.className = v; else if (k === "html") el.innerHTML = v; else if (k.startsWith("on")) el.addEventListener(k.slice(2), v); else el.setAttribute(k, v); }
-  for (const k of kids.flat()) if (k != null && k !== false) el.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  for (const k of kids.flat(Infinity)) if (k != null && k !== false) el.append(k instanceof Node ? k : document.createTextNode(String(k)));
   return el; };
 const fmt = (t) => t ? new Date(t * 1000).toLocaleString() : "";
 const STATUS = { tested: ["✓", "Tested"], partial: ["◐", "Partly tested"], not_tested: ["✕", "Not tested"], not_applicable: ["–", "Not applicable"], not_recorded: ["?", "Not recorded"] };
@@ -135,9 +149,56 @@ app.append(E("div", { class: "tiles" },
   E("div", { class: "tile b-problems" }, E("b", {}, counts.problems), "APIs with problems"),
   E("div", { class: "tile b-incomplete" }, E("b", {}, counts.incomplete), "APIs not fully tested"),
   E("div", { class: "tile b-ok" }, E("b", {}, counts.ok), "APIs with no problems"),
-  E("div", { class: "tile" }, E("b", {}, allTests.length), `tests · ${tv("pass")} passed · ${tv("fail")} failed`)));
+  E("div", { class: "tile" }, E("b", {}, allTests.length), `tests · ${tv("pass")} passed · ${tv("fail")} failed`),
+  ...(() => {
+    const blocked = D.apis.filter((a) => (a.access || {}).status === "blocked").length;
+    const partial = D.apis.filter((a) => (a.access || {}).status === "partial").length;
+    return blocked || partial ? [E("div", { class: "tile a-blocked" }, E("b", {}, blocked + partial),
+      `APIs not tested due to access${partial ? ` (${blocked} fully, ${partial} partly)` : ""}`)] : [];
+  })()));
 
 if (D.warnings.length) app.append(E("div", { class: "panel warn" }, E("b", {}, "Read this first"), E("ul", {}, D.warnings.map((w) => E("li", {}, w)))));
+
+/* priorities: what to fix first */
+const sevBadge = (s) => s ? E("span", { class: "sevb sev-" + s }, s) : "";
+const apiLink = (op) => op ? E("a", { href: "#" + slug(op) }, op) : E("i", {}, "whole Swagger / not tied to one API");
+const apisList = (list, max = 5) => E("div", { class: "apis-list" },
+  list.slice(0, max).map((x, i) => [i ? ", " : "", apiLink(x.operation), E("span", {}, ` (${x.fails})`)]),
+  list.length > max ? E("span", {}, ` and ${list.length - max} more`) : null);
+const S = D.summary || { causes: [], top: [], crashes: [], wrong_types: [] };
+const ACCESS = { blocked: "Not tested: access issue", partial: "Partly not tested: access issue" };
+const prio = E("div", { class: "panel prio" });
+const accessApis = D.apis.filter((a) => a.access && a.access.status !== "ok");
+if (accessApis.length) prio.append(E("h3", {}, `APIs not tested due to access issues (${accessApis.length})`),
+  E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "API"), E("th", {}, "Status"), E("th", {}, "Why"))),
+    E("tbody", {}, accessApis.map((a) => E("tr", {}, E("td", { style: "white-space:nowrap" }, apiLink(a.operation)),
+      E("td", { class: "a-" + a.access.status, style: "white-space:nowrap" }, E("b", {}, ACCESS[a.access.status])),
+      E("td", {}, a.access.reason))))));
+const causeTable = (list) => E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "Severity"), E("th", {}, "Problem"),
+    E("th", {}, "APIs"), E("th", {}, "Failed tests"), E("th", {}, "Recommended fix"))),
+  E("tbody", {}, list.map((g) => E("tr", {}, E("td", {}, sevBadge(g.severity)),
+    E("td", {}, E("b", {}, g.title), g.spec_issue && !r.lenient ? E("span", { class: "tag", title: "The API and the Swagger disagree. Either one may be wrong." }, "API vs Swagger") : null,
+      apisList(g.apis)),
+    E("td", { class: "n" }, g.apis.length), E("td", { class: "n" }, g.tests), E("td", { class: "fix" }, g.fix)))));
+const bugs = S.causes.filter((g) => !(r.lenient && g.spec_issue));
+const specProblems = S.causes.filter((g) => r.lenient && g.spec_issue);
+if (bugs.length) prio.append(E("h3", {}, "Problems by root cause, most severe first"), causeTable(bugs));
+if (specProblems.length) prio.append(E("h3", {}, "Swagger problems (lenient mode: the Swagger isn't trusted, so these don't fail the run)"),
+  causeTable(specProblems));
+if (S.top.length) prio.append(E("h3", {}, `Top ${S.top.length} APIs by failed tests`),
+  E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "#"), E("th", {}, "API"), E("th", {}, "Failed tests"), E("th", {}, "Worst"), E("th", {}, "Main problems"))),
+    E("tbody", {}, S.top.map((t, i) => E("tr", {}, E("td", { class: "n muted" }, i + 1), E("td", {}, apiLink(t.operation)),
+      E("td", { class: "n" }, t.fails), E("td", {}, sevBadge(t.worst)), E("td", {}, t.causes.slice(0, 3).join(" · ")))))));
+if (S.crashes.length) prio.append(E("h3", {}, `APIs that crash with a server error (${S.crashes.length})`),
+  E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "API"), E("th", {}, "Crashing requests"), E("th", {}, "HTTP"), E("th", {}, "Server said"))),
+    E("tbody", {}, S.crashes.map((c) => E("tr", {}, E("td", {}, apiLink(c.operation)), E("td", { class: "n" }, c.requests),
+      E("td", {}, c.codes.join(", ")), E("td", { class: "muted" }, c.server_said || "—"))))));
+if (S.wrong_types.length) prio.append(E("h3", {}, `APIs that accept wrong data types (${S.wrong_types.length})`),
+  E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "API"), E("th", {}, "Accepted"), E("th", {}, "Fields and the wrong values they accepted"))),
+    E("tbody", {}, S.wrong_types.map((w) => E("tr", {}, E("td", {}, apiLink(w.operation)), E("td", { class: "n" }, w.requests),
+      E("td", {}, Object.entries(w.fields).map(([f, vals], i) => [i ? E("br") : null, E("code", {}, f), " ← ",
+        vals.map((v) => JSON.stringify(v)).join(", ")])))))));
+if (prio.childNodes.length) app.append(E("h2", {}, "Fix these first"), prio);
 
 const leg = E("details", { class: "panel" }, E("summary", {}, "What each test does"), E("dl", { class: "legend" },
   Object.entries(D.stage_info).map(([k, [n, d]]) => [E("dt", {}, n), E("dd", {}, d)]),
@@ -159,24 +220,29 @@ D.apis.forEach((a) => {
     return E("td", { class: "dots s-" + (worst || ""), title: items.map((i) => `${i.test}: ${STATUS[i.status][1]}. ${i.reason}`).join("\n") }, E("span", {}, icon));
   });
   tb.append(E("tr", {}, E("td", {}, method(a.method), " ", E("a", { href: "#" + slug(a.operation) }, E("code", {}, a.path))),
-    E("td", {}, E("span", { class: "badge b-" + a.verdict }, VERDICT[a.verdict])), ...cells, E("td", {}, a.counts.fail || 0)));
+    E("td", {}, E("span", { class: "badge b-" + a.verdict }, VERDICT[a.verdict]),
+      a.access && a.access.status !== "ok" ? [" ", E("span", { class: "badge a-" + a.access.status, title: a.access.reason },
+        a.access.status === "blocked" ? "access: not tested" : "access: partly")] : null),
+    ...cells, E("td", {}, a.counts.fail || 0)));
 });
 idx.append(tb);
 app.append(E("h2", {}, "All APIs"), E("div", { class: "panel" }, idx, E("p", { class: "muted" }, "Hover a symbol to see why. Click an API for its details.")));
 
 /* per API */
 const testRow = (t) => {
-  const tr = E("tr", { class: "t" }, E("td", { class: "muted" }, t.seq), E("td", {}, (D.stage_info[t.stage] || [t.stage])[0]),
+  const tr = E("tr", { class: "t" }, E("td", { class: "muted" }, t.seq), E("td", {}, sevBadge(t.sev)), E("td", {}, (D.stage_info[t.stage] || [t.stage])[0]),
     E("td", {}, t.scenario, t.verdict !== "pass" && t.explanation ? E("div", { class: "v-" + t.verdict, style: "font-size:12.5px" }, t.explanation) : null),
     E("td", {}, t.res ? String(t.res.status ?? "") : ""), E("td", {}, E("span", { class: "badge v-" + t.verdict }, t.verdict)));
   tr.addEventListener("click", () => {
     if (tr.nextSibling && tr.nextSibling.classList && tr.nextSibling.classList.contains("d")) { tr.nextSibling.remove(); return; }
     const kv = (h) => Object.keys(h || {}).length ? E("table", { class: "kv" }, Object.entries(h).map(([k, v]) => E("tr", {}, E("th", {}, k), E("td", {}, v)))) : E("div", { class: "muted" }, "none");
     const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } };
-    tr.after(E("tr", { class: "d" }, E("td", { colspan: 5 },
+    tr.after(E("tr", { class: "d" }, E("td", { colspan: 6 },
       E("h3", {}, "What was tested"), E("div", {}, t.scenario),
       E("h3", {}, "Expected"), E("div", {}, t.expected || "—"),
       E("h3", {}, "Result"), E("div", { class: "v-" + t.verdict }, t.explanation || t.verdict),
+      t.sev ? [E("h3", {}, "Severity and root cause"), E("div", {}, sevBadge(t.sev), " ", t.cause),
+               E("h3", {}, "Recommended fix"), E("div", {}, t.fix)] : null,
       t.req ? [E("h3", {}, "Input (request)"), E("div", {}, E("code", {}, `${t.req.method} ${t.req.url}`)), kv(t.req.headers),
                t.req.body ? E("pre", {}, pretty(t.req.body)) : null] : null,
       t.res ? [E("h3", {}, `Output (response) — HTTP ${t.res.status ?? ""}${t.res.ms != null ? ` · ${t.res.ms} ms` : ""}`), kv(t.res.headers),
@@ -196,7 +262,7 @@ const testsTable = (list) => {
       return n || m === "all" ? E("button", { class: mode === m ? "on" : "", onclick: () => { mode = m; draw(); } }, `${m === "all" ? "All" : m} (${n})`) : null;
     }));
     const LIMIT = 300;
-    const t = E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "#"), E("th", {}, "Test"), E("th", {}, "What was tested / what went wrong"), E("th", {}, "HTTP"), E("th", {}, "Result"))),
+    const t = E("table", {}, E("thead", {}, E("tr", {}, E("th", {}, "#"), E("th", {}, "Severity"), E("th", {}, "Test"), E("th", {}, "What was tested / what went wrong"), E("th", {}, "HTTP"), E("th", {}, "Result"))),
       E("tbody", {}, shown.slice(0, LIMIT).map(testRow)));
     box.append(fb, t, shown.length > LIMIT ? E("p", { class: "muted" }, `Showing ${LIMIT} of ${shown.length}. The CSV/NDJSON downloads have all of them.`) : null);
   };
@@ -210,12 +276,16 @@ D.apis.forEach((a) => {
     E("div", { class: "api-head" }, method(a.method), E("span", { class: "p" }, a.path), E("span", { class: "badge b-" + a.verdict }, VERDICT[a.verdict]),
       a.secured ? E("span", { class: "muted" }, "🔒 needs login") : E("span", { class: "muted" }, "public")),
     a.summary ? E("div", { class: "muted" }, a.summary) : null,
+    a.access && a.access.status !== "ok" ? E("div", { class: "access " + a.access.status }, E("b", { class: "a-" + a.access.status },
+      ACCESS[a.access.status] + ". "), a.access.reason.replace(/^[^:]+: (.)/, (_, c) => c.toUpperCase())) : null,
     E("h3", {}, "What was tested"),
     E("table", {}, E("tbody", {}, a.tests.map((t) => E("tr", {}, E("td", { style: "width:220px" }, t.test),
       E("td", { style: "width:150px", class: "s-" + t.status }, STATUS[t.status][0] + " " + STATUS[t.status][1]), E("td", {}, t.reason))))));
   const fs = D.findings[a.operation] || [];
   if (fs.length) sec.append(E("h3", {}, `Problems found (${fs.length})`), E("table", {}, E("tbody", {}, fs.map((f) =>
-    E("tr", {}, E("td", { style: "width:90px", class: "sev-" + f.severity }, E("b", {}, f.severity.toUpperCase())), E("td", {}, f.title,
+    E("tr", {}, E("td", { style: "width:90px" }, sevBadge(f.severity)), E("td", {}, f.title,
+      f.spec_issue ? E("span", { class: "tag", title: "The API and the Swagger disagree. Either one may be wrong." }, r.lenient ? "Swagger problem" : "API vs Swagger") : null,
+      f.fix ? E("div", { class: "fix" }, E("b", {}, "How to fix: "), f.fix) : null,
       f.detail ? E("details", {}, E("summary", { class: "muted", style: "font-weight:400" }, "details"), E("pre", {}, f.detail)) : null))))));
   const ts = D.tests[a.operation] || [];
   if (ts.length) sec.append(E("h3", {}, `Every test sent to this API (${ts.length}) — click a row for the full input and output`), testsTable(ts));
