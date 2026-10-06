@@ -470,7 +470,7 @@ function setupLogin(form, k, pid, pendingSecrets) {
 function renderProjectForm(root, project, onSaved) {
   const isNew = !project;
   const p = project || { name: "", description: "", spec: "", base_url: "", headers: "", headers_b: "", stages: null,
-    max_examples: 50, fail_on: "high", no_mutating_authz: false, exclude_paths: [], bola: [], operations: [] };
+    max_examples: 50, fail_on: "high", no_mutating_authz: false, lenient_spec: false, exclude_paths: [], bola: [], operations: [] };
   let ops = p.operations || [];
   let chosenSpec = p.spec;
 
@@ -519,6 +519,10 @@ function renderProjectForm(root, project, onSaved) {
           <label class="field">Fail threshold <select name="fail_on">${["critical", "high", "medium", "low"].map((s) => `<option ${s === p.fail_on ? "selected" : ""}>${s}</option>`).join("")}</select></label>
         </div>
         <label class="check"><input name="no_mutating_authz" type="checkbox" ${p.no_mutating_authz ? "checked" : ""}> Auth checks: only send GET / HEAD / OPTIONS</label>
+        <label class="check"><input name="lenient_spec" type="checkbox" ${p.lenient_spec ? "checked" : ""}> The Swagger isn't reliable (lenient mode)</label>
+        <p class="hint" style="margin-top:-6px">Crashes, wrong types accepted, missing login checks, cross-user leaks and security alerts are still reported as usual.
+          Mismatches with the Swagger (undocumented status codes, response shape, validation rules) are listed as <b>Swagger problems</b>
+          with severity info, so they don't bury the real bugs or fail the run.</p>
         <label class="field">Exclude paths <small>regex, one per line</small>
           <textarea name="exclude_paths" rows="2" placeholder="^/internal/">${esc((p.exclude_paths || []).join("\n"))}</textarea></label>
       </details>
@@ -597,7 +601,7 @@ function renderProjectForm(root, project, onSaved) {
       headers: f("headers").value, headers_b: f("headers_b").value,
       stages: $$("input[name=stage]:checked", form).map((i) => i.value),
       max_examples: parseInt(f("max_examples").value, 10) || 50, fail_on: f("fail_on").value,
-      no_mutating_authz: f("no_mutating_authz").checked,
+      no_mutating_authz: f("no_mutating_authz").checked, lenient_spec: f("lenient_spec").checked,
       exclude_paths: f("exclude_paths").value.split("\n").map((s) => s.trim()).filter(Boolean),
       bola: readBola(bolaBox),
       login_a: readLogin(form, "a"), login_b: readLogin(form, "b"),
@@ -799,10 +803,12 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
         <td class="c"><input type="checkbox" data-op="${esc(o.label)}" ${selected.has(o.label) ? "checked" : ""} ${o.excluded ? "disabled" : ""}></td>
         <td>${methodBadge(o.method)}</td>
         <td><div class="path">${esc(o.path)} ${o.secured ? '<span class="lock" title="Spec says this needs auth">🔒</span>' : ""}
-          ${o.excluded ? `<span class="tag-excluded" title="Matches Exclude paths in Settings; never tested">excluded</span>` : ""}</div>
+          ${o.excluded ? `<span class="tag-excluded" title="Matches Exclude paths in Settings; never tested">excluded</span>` : ""}
+          ${p.examples?.[o.label] ? `<span class="tag-example" title="Tests start from your saved working request">example</span>` : ""}</div>
           ${o.summary ? `<div class="summ">${esc(o.summary)}</div>` : ""}</td>
         <td class="res">${o.excluded && !p.op_status[o.label] ? `<span class="untested">excluded</span>` : resCell(o)}</td>
-        <td class="act"><button class="secondary small" data-run1="${esc(o.label)}" ${p.running || o.excluded ? "disabled" : ""}
+        <td class="act"><button class="icon" data-example="${esc(o.label)}" title="Working example: the request this API's tests start from">✎</button>
+          <button class="secondary small" data-run1="${esc(o.label)}" ${p.running || o.excluded ? "disabled" : ""}
           title="${o.excluded ? "Excluded in Settings" : "Test only this API"}">▶ Run</button></td>
       </tr>`).join("")}`).join("") || `<tr><td colspan="5" class="none">No APIs match.</td></tr>`;
     $("[data-act=all]", root).checked = allSel(shown);
@@ -826,6 +832,8 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
   root.addEventListener("click", async (e) => {
     const run1 = e.target.closest("[data-run1]");
     if (run1) return startRun([run1.dataset.run1]);
+    const exb = e.target.closest("[data-example]");
+    if (exb) return editExample(p, ops.find((o) => o.label === exb.dataset.example), () => route());
     const det = e.target.closest("[data-detail]");
     if (!det) return;
     const label = det.dataset.detail;
@@ -849,6 +857,58 @@ function renderApisTab(root, p, selected, onSelChange, startRun) {
   });
 }
 
+/** The working request an API's tests start from (instead of the Swagger's example). */
+async function editExample(p, o, onChange, draft = null) {
+  let info;
+  try { info = await api(`/api/projects/${p.id}/example?${new URLSearchParams({ op: o.label })}`); }
+  catch (e) { return toast(e.message, true); }
+  const saved = info.saved, last = info.last;
+  const pretty = (v) => v == null ? "" : JSON.stringify(v, null, 2);
+  const start = draft || {
+    body: pretty(saved ? saved.body : last?.body),
+    path: pretty(saved?.path || (o.path_params.length ? Object.fromEntries(o.path_params.map((n) => [n, ""])) : null)),
+    query: pretty(saved?.query || null),
+  };
+  const lastHtml = last ? `<div class="${last.accepted ? "hint" : "warn"}">The last run (${esc(fmtTime(last.started))}) sent the body below
+      ${last.accepted ? `and the API <b>accepted</b> it (HTTP ${esc(last.status)}).` :
+        `and the API <b>refused</b> it: HTTP ${esc(last.status)}${last.said ? ` — “${esc(last.said)}”` : ""}. Fix the values and save.`}
+      <div class="muted" style="margin-top:4px"><code>${esc(last.url)}</code></div></div>` : "";
+  const html = `<p class="hint">The wrong-type tests start from this request, and the behaviour tests send it as an example.
+      Use values that really exist on the test environment (real IDs, a site name that exists). Your Swagger isn't changed.</p>
+    ${saved ? `<p class="hint"><b>Saved.</b> Runs use this instead of the Swagger's example.</p>` : lastHtml}
+    <label class="field">Request body (JSON)${o.has_body ? "" : " <small>this API has no body</small>"}
+      <textarea rows="12" data-x="body" spellcheck="false" placeholder='{"name": "…"}'>${esc(start.body)}</textarea></label>
+    <div class="grid2">
+      <label class="field">Path parameters (JSON) <textarea rows="3" data-x="path" spellcheck="false" placeholder='{"id": "123"}'>${esc(start.path)}</textarea></label>
+      <label class="field">Query parameters (JSON) <textarea rows="3" data-x="query" spellcheck="false" placeholder='{"siteId": "1"}'>${esc(start.query)}</textarea></label>
+    </div>`;
+  const read = () => Object.fromEntries(["body", "path", "query"].map((k) => [k, $(`#dialog [data-x=${k}]`).value]));
+  let typed = null;
+  const choice = await dialog(`Working example · ${o.label}`, html, [
+    { label: "Save", cls: "primary", value: "save", onClick: () => (typed = read()) },
+    ...(saved ? [{ label: "Remove", cls: "danger", value: "remove" }] : []),
+    { label: "Cancel", value: null },
+  ]);
+  if (choice === "remove") {
+    try { await api(`/api/projects/${p.id}/example?${new URLSearchParams({ op: o.label })}`, { method: "DELETE" }); toast("Example removed"); onChange(); }
+    catch (e) { toast(e.message, true); }
+    return;
+  }
+  if (choice !== "save") return;
+  const parse = (k, what) => {
+    const t = typed[k].trim();
+    if (!t) return k === "body" ? null : {};
+    const v = JSON.parse(t);
+    if (k !== "body" && (typeof v !== "object" || Array.isArray(v) || v === null)) throw new Error(`${what} must be a JSON object like {"id": "123"}`);
+    return k === "body" ? v : Object.fromEntries(Object.entries(v).filter(([, x]) => x !== "" && x != null).map(([n, x]) => [n, String(x)]));
+  };
+  let body;
+  try { body = { op: o.label, body: parse("body", "Request body"), path: parse("path", "Path parameters"), query: parse("query", "Query parameters") }; }
+  catch (e) { toast(`Not valid JSON: ${e.message}`, true); return editExample(p, o, onChange, typed); }
+  try { await api(`/api/projects/${p.id}/example`, { method: "PUT", body: JSON.stringify(body) }); toast("Example saved. The next run starts from it."); onChange(); }
+  catch (e) { toast(e.message, true); return editExample(p, o, onChange, typed); }
+}
+
 async function renderRunsTab(root, pid) {
   root.innerHTML = `<p class="muted">Loading…</p>`;
   const runs = await api(`/api/projects/${pid}/runs`);
@@ -868,7 +928,9 @@ function findingsHtml(list) {
   return list.slice(0, 500).map((f) => `
     <div class="finding"><details>
       <summary><span class="sev ${f.severity}">${f.severity}</span>
-        <span>${esc(f.title)}<span class="stage-tag">${esc(f.stage)}</span></span>
+        <span>${esc(f.title)}<span class="stage-tag">${esc(f.stage)}</span>${f.spec_issue
+          ? `<span class="stage-tag spec" title="The API and the Swagger disagree. Either one may be wrong.">API vs Swagger</span>` : ""}
+          ${f.fix ? `<div class="fix"><b>How to fix:</b> ${esc(f.fix)}</div>` : ""}</span>
         <span class="where">${esc(f.endpoint)}</span></summary>
       <pre>${esc(f.detail || "No further detail.")}</pre>
     </details></div>`).join("") + (list.length > 500 ? `<div class="none">Showing 500 of ${list.length}. Narrow the filter.</div>` : "");
@@ -998,7 +1060,7 @@ async function pageRun(runId, params = {}) {
         <div class="summary">${["fail", "pass", "error", "info"].map((v) =>
           `<button class="pill v-${v} ${res.verdicts[v] ? "" : "zero"} ${logFilter.verdict === v ? "active" : ""}" data-lverdict="${v}"><b>${res.verdicts[v] || 0}</b>${v}</button>`).join("")}
           ${live ? `<button class="secondary small" data-act="lrefresh">↻ Refresh</button>` : ""}</div>
-        <table class="log"><thead><tr><th>#</th><th>Stage</th><th>API</th><th>Scenario tested</th><th>Status</th><th>Verdict</th></tr></thead>
+        <table class="log"><thead><tr><th>#</th><th>Severity</th><th>Stage</th><th>API</th><th>Scenario tested</th><th>Status</th><th>Verdict</th></tr></thead>
           <tbody data-out="lrows"></tbody></table>
         <div data-out="lmore"></div>`;
       $$("[data-lstage]", box).forEach((b) => b.addEventListener("click", () => { logFilter.stage = b.dataset.lstage; drawLog(); }));
@@ -1017,7 +1079,7 @@ async function pageRun(runId, params = {}) {
       });
     }
     $("[data-out=lrows]", box).insertAdjacentHTML("beforeend", res.items.map(logRow).join("") ||
-      (append ? "" : `<tr><td colspan="6" class="none">No tests match.</td></tr>`));
+      (append ? "" : `<tr><td colspan="7" class="none">No tests match.</td></tr>`));
     $("[data-out=lmore]", box).innerHTML = logItems.length < res.total
       ? `<div class="actions"><button class="secondary" data-act="lmore">Load more (${logItems.length} of ${res.total})</button></div>`
       : `<p class="hint">${res.total} test${res.total === 1 ? "" : "s"} shown.</p>`;
@@ -1025,7 +1087,8 @@ async function pageRun(runId, params = {}) {
   };
 
   const logRow = (e) => `<tr data-seq="${e.seq}" class="lr v-${esc(e.verdict)}">
-    <td class="n">${e.seq}</td><td class="st">${esc(e.stage)}</td>
+    <td class="n">${e.seq}</td><td class="sv">${e.severity ? `<span class="sev ${esc(e.severity)}" title="${esc(e.cause || "")}">${esc(e.severity)}</span>` : ""}</td>
+    <td class="st">${esc(e.stage)}</td>
     <td class="op">${e.operation ? opLabel(e.operation) : `<span class="muted">${esc(e.method || "")}</span>`}</td>
     <td class="sc"><div>${esc(e.scenario)}</div>${e.verdict !== "pass" && (e.explanation || e.problem)
       ? `<div class="pr v-${esc(e.verdict)}">${esc(e.explanation || e.problem)}</div>` : ""}</td>
@@ -1039,7 +1102,7 @@ async function pageRun(runId, params = {}) {
     if (tr.nextElementSibling?.classList.contains("ldetail")) { tr.nextElementSibling.remove(); return; }
     const d = document.createElement("tr");
     d.className = "ldetail";
-    d.innerHTML = `<td colspan="6"><p class="muted">Loading…</p></td>`;
+    d.innerHTML = `<td colspan="7"><p class="muted">Loading…</p></td>`;
     tr.after(d);
     const e = await api(`/api/runs/${runId}/log/${tr.dataset.seq}`);
     const rq = e.request, rs = e.response, det = { ...e.details };
@@ -1049,7 +1112,10 @@ async function pageRun(runId, params = {}) {
         <div><h4>Scenario</h4><p>${esc(e.scenario)}</p><h4>Expected</h4><p>${esc(e.expected || "—")}</p></div>
         <div><h4>Result</h4><p><span class="verdict v-${esc(e.verdict)}">${esc(e.verdict)}</span> · ${esc(new Date(e.ts * 1000).toLocaleString())}</p>
           ${e.explanation ? `<p class="v-${esc(e.verdict)}">${esc(e.explanation)}</p>` : ""}
-          ${failures?.length > 1 ? `<h4>Every failed check</h4><ul class="fails">${failures.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}</div>
+          ${failures?.length > 1 ? `<h4>Every failed check</h4><ul class="fails">${failures.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
+          ${e.triage?.severity ? `<h4>Severity</h4><p><span class="sev ${esc(e.triage.severity)}">${esc(e.triage.severity)}</span>
+            ${e.triage.spec_issue ? `<span class="muted">· the API and the Swagger disagree</span>` : ""}</p>
+            <h4>Recommended fix</h4><p>${esc(e.triage.fix)}</p>` : ""}</div>
       </div>
       ${rq ? `<h4>Request</h4><p><code>${esc(rq.method)} ${esc(rq.url)}</code></p>${kv(rq.headers)}
         ${rq.body ? `<pre>${esc(pretty(rq.body))}</pre>` : ""}` : ""}
@@ -1103,6 +1169,12 @@ async function pageRun(runId, params = {}) {
     const ops = [...new Set(list.map((f) => f.operation).filter(Boolean))].sort();
     box.innerHTML = `
       ${run.status === "cancelled" ? `<div class="warn" style="margin:0 0 12px">Stopped early. Results below are only from the tests that finished.</div>` : ""}
+      ${run.access?.length ? `<details class="box access-box" open><summary>APIs not tested due to access issues <span class="count">${run.access.length}</span></summary>
+        <table class="access-tbl">${run.access.map((a) => `<tr><td class="op">${opLabel(a.operation)}</td>
+          <td class="a-${esc(a.status)}"><b>${a.status === "blocked" ? "Not tested" : "Partly not tested"}</b></td>
+          <td>${esc(a.reason.replace(/^[^:]+: (.)/, (_, c) => c.toUpperCase()))}</td></tr>`).join("")}</table></details>` : ""}
+      ${run.lenient_spec ? `<p class="hint">Lenient mode: mismatches with the Swagger are listed with severity <b>info</b> and tagged
+        <i>API vs Swagger</i>, so they don't fail the run.</p>` : ""}
       <div class="summary">${SEVS.map((s) => `<button class="pill ${s} ${counts[s] ? "" : "zero"} ${filter.sev === s ? "active" : ""}" data-sev="${s}"><b>${counts[s]}</b>${s}</button>`).join("")}</div>
       <div class="filters">
         <div class="tabs">${["all", ...run.report.stages.map((s) => s.name)].map((s) => {

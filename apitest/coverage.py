@@ -11,7 +11,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .explain import STAGES
+from .explain import ACCESS_TEXT, STAGES, failure_body, is_auth_probe, is_method_probe, server_said
 from .testlog import iter_entries
 
 WRITE = {"post", "put", "patch", "delete"}
@@ -74,6 +74,7 @@ def build(operations, settings: dict, stage_results: dict, log_path: Path) -> di
                                    else "No Swagger rule problems for this API.", len(mine), fails))
             elif s == "conformance":
                 items.append(_conformance(o, mine, has_a, secured_401))
+                _note_blocked(items[-1], mine)
             elif s == "types":
                 items.append(_types(o, mine))
             elif s == "authz":
@@ -84,7 +85,7 @@ def build(operations, settings: dict, stage_results: dict, log_path: Path) -> di
                                    f"ZAP raised {len(fails)} alert(s) for this API." if fails else
                                    "Scanned by ZAP; no alerts were raised for this API. (ZAP reports only problems, "
                                    "so the individual requests it sent aren't listed.)", len(mine), len(fails)))
-        apis.append(_api(o, items, entries))
+        apis.append(_api(o, items, entries, access=_access(o, entries, has_a)))
 
     # run-level warnings, most important first
     secured = [o for o in operations if o.secured]
@@ -103,13 +104,18 @@ def build(operations, settings: dict, stage_results: dict, log_path: Path) -> di
         warnings.append("User A's token was refused for almost every request to protected APIs (401/403). It may be "
                         "expired, for the wrong environment, or missing permissions. Most behaviour tests only covered "
                         "the \"not logged in\" path.")
-    writes_ok = sum(1 for e in iter_entries(log_path)
-                    if (e.get("request") or {}).get("method", "").lower() in WRITE
-                    and 200 <= ((e.get("response") or {}).get("status") or 0) < 300)
+    writes_2xx = [e for e in iter_entries(log_path)
+                  if (e.get("request") or {}).get("method", "").lower() in WRITE
+                  and 200 <= ((e.get("response") or {}).get("status") or 0) < 300]
+    refused_200 = sum(1 for e in writes_2xx if failure_body((e.get("response") or {}).get("body")))
+    writes_ok = len(writes_2xx) - refused_200
     if writes_ok:
         warnings.append(f"{writes_ok} write request(s) (POST/PUT/PATCH/DELETE) were accepted by the API, so test "
-                        "data was written to whatever database it uses. Exclude write APIs (Settings → Exclude paths) "
-                        "when testing against real data.")
+                        "data was written to whatever database it uses, and repeated runs can find it there "
+                        "(e.g. \"already exists\"). Exclude write APIs (Settings → Exclude paths) when testing "
+                        "against shared data."
+                        + (f" Not counted: {refused_200} more that got HTTP 2xx but whose body says they failed."
+                           if refused_200 else ""))
     if "authz" in stages and not has_b:
         warnings.append("No second user (user B) was set, so no API was checked for cross-user data leaks (BOLA).")
     elif "authz" in stages and not bola_ops:
@@ -193,6 +199,76 @@ def _conformance(o, mine, has_a, secured_401):
                  f"{len(mine)} requests (responses: {spread}); all checks passed.", len(mine), fails)
 
 
+def _said(e) -> str:
+    rs = e.get("response") or {}
+    st = rs.get("status") or 0
+    return (failure_body(rs.get("body")) if 200 <= st < 300 else "") or server_said(rs.get("body"))
+
+
+def _blocked(e) -> bool:
+    """A request that should have reached the API's logic but was refused for access reasons first: 401/403, or
+    another status whose body says so ("400 User is not authorized", "200 API key is required"). Requests that
+    test the login itself (a refusal is the right answer there) are logged as pass, so they don't count."""
+    if e["verdict"] != "error" or not e.get("response"):
+        return False
+    return e["response"].get("status") in (401, 403) or bool(ACCESS_TEXT.search(_said(e)))
+
+
+def _note_blocked(item, mine):
+    """Behaviour tests where only some requests were refused: say so, and mark them partly tested."""
+    blocked = sum(1 for e in mine if _blocked(e))
+    if item["status"] == "tested" and blocked:
+        item["status"] = "partial"
+        item["reason"] += (f" {blocked} of the {len(mine)} requests were refused with 401/403 before being processed "
+                           "(access issue), so those weren't really tested.")
+
+
+def _access(o, entries, has_a) -> dict:
+    """Could the tests reach this API's real logic, or did an access problem (401/403) stop them?
+    status: ok | partial (some tests refused) | blocked (every test refused)."""
+    def refused(e):
+        if _blocked(e):
+            return True
+        # with no token at all, refusals aren't marked "not really tested" (nothing was sent to refuse), but the
+        # API's logic was still never reached. Requests that test the login itself don't count.
+        return (not has_a and o.secured and e["stage"] == "conformance"
+                and (e.get("response") or {}).get("status") in (401, 403)
+                and not is_auth_probe(e["scenario"]) and not is_method_probe(e["scenario"]))
+    blocked = [e for e in entries if refused(e)]
+    if not blocked:
+        return {"status": "ok", "refused": 0, "reached": 0, "reason": ""}
+    reached = [e for e in entries if e["stage"] in ("conformance", "types", "authz") and not refused(e)
+               and e.get("response") and (e["response"].get("status") not in (401, 403))
+               and not e["scenario"].startswith("Protected API called with")
+               and not is_auth_probe(e["scenario"]) and not is_method_probe(e["scenario"])]
+    codes = "/".join(str(c) for c in sorted({e["response"]["status"] for e in blocked}))
+    perms = sorted(_missing_permissions({o.label: blocked}))
+    said = Counter(s for s in (_said(e) for e in blocked) if s).most_common(1)
+    said = said[0][0] if said else ""
+    if perms:
+        why = f"user A lacks the permission {', '.join(f'`{p}`' for p in perms)}"
+    elif re.search(r"api[ _-]?key", said, re.I):
+        why = ("the API needs an API key that isn't set for user A (add the key's header under Settings → "
+               "Test users)")
+    elif not has_a:
+        why = "no token was set for user A"
+    elif said and ACCESS_TEXT.search(said):
+        why = "user A isn't allowed to use this API (check the test user's roles)"
+    else:
+        why = "user A's token was refused (expired, wrong environment or missing permissions?)"
+    if said:
+        why += f'; the server said "{said}"'
+    stages = Counter(e["stage"] for e in blocked)
+    where = ", ".join(f"{STAGES.get(s, (s,))[0]}: {n}" for s, n in stages.items())
+    if not reached:
+        return {"status": "blocked", "refused": len(blocked), "reached": 0,
+                "reason": f"Not tested due to an access issue: every request meant to reach this API's logic was "
+                          f"refused with HTTP {codes} because {why} ({where})."}
+    return {"status": "partial", "refused": len(blocked), "reached": len(reached),
+            "reason": f"Partly not tested due to an access issue: {len(blocked)} of {len(blocked) + len(reached)} "
+                      f"requests were refused with HTTP {codes} because {why} ({where}); the rest reached the API."}
+
+
 def _types(o, mine):
     name = STAGES["types"][0]
     if o.method not in ("post", "put", "patch") or not o.has_body:
@@ -251,7 +327,7 @@ def _authz(o, mine, has_b, has_bola):
     return out
 
 
-def _api(o, items, entries, excluded=False):
+def _api(o, items, entries, excluded=False, access=None):
     fails = [e for e in entries if e["verdict"] == "fail"]
     counts = Counter(e["verdict"] for e in entries)
     statuses = {i["status"] for i in items}
@@ -265,15 +341,16 @@ def _api(o, items, entries, excluded=False):
         verdict = "ok"
     return {"operation": o.label, "method": o.method, "path": o.path, "summary": o.op.get("summary") or "",
             "secured": o.secured, "excluded": excluded, "verdict": verdict, "counts": dict(counts),
-            "tests": items}
+            "access": access or {"status": "ok", "refused": 0, "reached": 0, "reason": ""}, "tests": items}
 
 
 def write(cov: dict, out: Path) -> None:
     (out / "coverage.json").write_text(json.dumps(cov, indent=2), encoding="utf-8")
     with open(out / "coverage.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["api", "overall", "test", "status", "requests", "failed", "reason"])
+        w.writerow(["api", "overall", "access", "test", "status", "requests", "failed", "reason"])
         for a in cov["apis"]:
+            access = (a.get("access") or {}).get("status", "ok")
             for t in a["tests"]:
-                w.writerow([a["operation"], a["verdict"], t["test"], t["status"], t["requests"], t["failed"],
+                w.writerow([a["operation"], a["verdict"], access, t["test"], t["status"], t["requests"], t["failed"],
                             t["reason"]])

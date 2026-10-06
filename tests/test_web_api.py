@@ -1148,7 +1148,10 @@ def test_log_unfiltered(client, logrun):
     assert log["operations"] == ["GET /a", "GET /b"]
     first = log["items"][0]
     assert set(first) == {"seq", "ts", "stage", "operation", "scenario", "expected", "verdict", "explanation",
-                          "method", "url", "status", "elapsed_ms", "problem"}
+                          "method", "url", "status", "elapsed_ms", "problem", "severity", "cause", "spec_issue"}
+    fails = [i for i in log["items"] if i["verdict"] == "fail"]
+    assert fails and all(i["severity"] and i["cause"] for i in fails)
+    assert all(i["severity"] is None for i in log["items"] if i["verdict"] != "fail")
     assert (first["method"], first["url"], first["status"], first["elapsed_ms"]) == ("GET", "http://fake.test/a", 401,
                                                                                     5.5)
     assert len(first["explanation"]) == 300 and first["problem"] == "" and first["expected"] == "Refused"
@@ -1204,7 +1207,7 @@ def test_log_entry(client, logrun):
     e = client.get(f"/api/runs/{logrun}/log/6").json()
     assert e["seq"] == 6 and json.loads(e["request"]["body"]) == {"name": "Zoë Ünique"}
     assert set(e) == {"seq", "ts", "stage", "operation", "scenario", "expected", "verdict", "explanation", "request",
-                      "response", "details"}
+                      "response", "details", "triage"}
     assert client.get(f"/api/runs/{logrun}/log/99").status_code == 404
     assert client.get(f"/api/runs/{logrun}/log/-1").status_code == 404
     assert client.get(f"/api/runs/{logrun}/log/abc").status_code == 422
@@ -1487,3 +1490,62 @@ def test_guide_downloads_match_docs_and_unknown_is_404():
         assert r.content == (docs / name).read_bytes(), f"apitest/web/guides/{name} is out of date: copy it from docs/"
     assert c.get("/guides/README.md").status_code == 404
     assert c.get("/guides/..%2Fapp.py").status_code == 404
+
+
+def test_lenient_setting_reaches_the_run(client, pipe):
+    pid = _create(client, lenient_spec=True)
+    assert client.get(f"/api/projects/{pid}").json()["lenient_spec"] is True
+    rid = _start(client, pid)
+    _wait(client, rid)
+    assert pipe.cfgs[-1].lenient_spec is True and client.get(f"/api/runs/{rid}").json()["lenient_spec"] is True
+    assert yaml.safe_load(client.get(f"/api/projects/{pid}/yaml").text)["lenient_spec"] is True
+
+
+def test_run_shows_access_issues_and_finding_fixes(client, data):
+    pid = _create(client)
+    _mkrun(data, "20240101-000000-aaaaaa", pid, tested=["GET /a"],
+           stages=[_stage("conformance", [("high", "GET /a")])])
+    d = data / "runs" / "20240101-000000-aaaaaa"
+    (d / "coverage.json").write_text(json.dumps({"apis": [
+        {"operation": "GET /a", "access": {"status": "blocked", "refused": 3, "reached": 0, "reason": "Not tested: x"}},
+        {"operation": "GET /b", "access": {"status": "ok", "refused": 0, "reached": 2, "reason": ""}}]}),
+        encoding="utf-8")
+    run = client.get("/api/runs/20240101-000000-aaaaaa").json()
+    assert run["access"] == [{"operation": "GET /a", "status": "blocked", "refused": 3, "reached": 0,
+                              "reason": "Not tested: x"}]
+    f = run["report"]["stages"][0]["findings"][0]
+    assert f["cause"] == "other" and f["fix"]
+
+
+def test_saved_examples_round_trip_and_reach_the_run(client, pipe, data):
+    pid = _create(client)
+    url = f"/api/projects/{pid}/example"
+    assert client.get(url, params={"op": "GET /items/{id}"}).json() == {"saved": None, "last": None}
+    r = client.put(url, json={"op": "GET /items/{id}", "path": {"id": "42"}, "query": {"q": "x"}})
+    assert r.status_code == 200
+    assert client.get(url, params={"op": "GET /items/{id}"}).json()["saved"] == {"path": {"id": "42"}, "query": {"q": "x"}}
+    for bad, msg in (({"op": "GET /nope", "body": {}}, "not in this project"),
+                     ({"op": "GET /items/{id}", "path": {"zzz": "1"}}, "no path parameter zzz"),
+                     ({"op": "GET /a"}, "Nothing to save")):
+        r = client.put(url, json=bad)
+        assert r.status_code == 400 and msg in r.text
+    assert client.get(f"/api/projects/{pid}").json()["examples"] == {"GET /items/{id}": {"path": {"id": "42"},
+                                                                                        "query": {"q": "x"}}}
+    rid = _start(client, pid)
+    _wait(client, rid)
+    assert pipe.cfgs[-1].examples == {"GET /items/{id}": {"path": {"id": "42"}, "query": {"q": "x"}}}
+    assert yaml.safe_load(client.get(f"/api/projects/{pid}/yaml").text)["examples"]["GET /items/{id}"]["path"] == {"id": "42"}
+    assert client.delete(url, params={"op": "GET /items/{id}"}).status_code == 200
+    assert client.delete(url, params={"op": "GET /items/{id}"}).status_code == 404
+
+
+def test_example_shows_what_the_last_run_sent(client, data):
+    pid = _create(client)
+    _mkrun(data, "20240101-000000-aaaaaa", pid, tested=["GET /a"], stages=[_stage("types")],
+           entries=[dict(stage="types", scenario="Valid request first (every field the correct type)",
+                         operation="GET /a", verdict="error",
+                         request={"method": "GET", "url": "http://fake.test/a", "body": '{"site": "nope"}'},
+                         response={"status": 200, "body": '{"status": "Failed", "message": "Site not found"}'})])
+    last = client.get(f"/api/projects/{pid}/example", params={"op": "GET /a"}).json()["last"]
+    assert last["body"] == {"site": "nope"} and last["status"] == 200 and last["said"] == "Site not found"
+    assert last["accepted"] is False and last["run_id"] == "20240101-000000-aaaaaa"

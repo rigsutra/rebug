@@ -127,6 +127,64 @@ aggressive traffic of the five, so run it against staging only.
 
 ---
 
+## Severity, root causes and access issues
+
+Every failed test gets a root cause, a severity and a recommended fix. The HTML report starts with
+**Fix these first**: problems grouped by root cause, the 10 APIs with the most failed tests, every
+API that crashes with a 5xx, and every API that accepts wrong data types.
+
+| Root cause | Severity |
+|---|---|
+| Works without a valid login, one user reads another's data (BOLA) | critical |
+| Server error (5xx) from any input, CORS `*` with credentials, missing required header not rejected | high |
+| Wrong type accepted (e.g. `"1"` for a number), null accepted on a required field, invalid input accepted, response doesn't match the schema, leaked stack traces | medium |
+| Undocumented status code or Content-Type, unsupported method not answered with 405, missing security header, null accepted on an optional field | low |
+| Swagger rule problems (`lint`) and ZAP alerts | the tool's own rating |
+
+When requests that should reach an API's logic are refused with 401/403, that API is marked
+**Not tested: access issue** (every such request refused) or **Partly not tested: access issue**
+(some refused), with the reason: no token, a refused token, or the missing permission. Requests
+that test the login itself (no token, fake token) don't count.
+
+### APIs that answer errors with HTTP 200
+
+Some APIs refuse a request but still answer HTTP 200, with the error in the body
+(`{"status": "Failed", "message": "..."}`, `{"success": false, ...}`). apitest reads the body: such a
+response counts as a refusal, so it isn't reported as "accepted the wrong type", "accepted invalid
+input" or "works without login", and it isn't counted as a write. Each such API gets one low
+finding instead: **Reports errors with HTTP 200 instead of 4xx**.
+
+Access refusals that don't use 401/403 ("400 User is not authorized", "200 API key is required")
+also count as access issues, and the reason quotes what the server said.
+
+### Saved working examples
+
+The wrong-type stage starts every API from a valid request. If the Swagger's example doesn't work
+on your environment (an ID that doesn't exist, a missing required field), the API is skipped. Save a
+request that works under the API's **✎** button on the APIs tab (body, path and query parameters),
+or as `examples:` in a CLI config:
+
+```yaml
+examples:
+  "POST /api/v1/WorkFlowTaskMaintenanceCost":
+    body: {taskId: 1018956, purchaseOrder: "PO-1", detail: "test", additionalCost: 1.5}
+  "GET /api/v1/site/{id}":
+    path: {id: "12"}
+```
+
+apitest writes them into its own copy of the Swagger before testing: the wrong-type stage starts
+from them and the behaviour tests send them as examples. Swagger-quality checks still judge your
+original Swagger.
+
+### When the Swagger isn't reliable: lenient mode
+
+Turn on *The Swagger isn't reliable (lenient mode)* in the project's Settings, or pass
+`--lenient-spec` on the CLI (`lenient_spec: true` in a config file). Findings that only show the
+API and the Swagger disagree (undocumented status codes, response shape, Content-Type, validation
+rules the Swagger declares, fields accepting null that the Swagger doesn't mark nullable) are listed as **Swagger problems** with severity info, so they don't
+fail the run. Crashes, wrong types accepted, missing login checks, BOLA and ZAP alerts are still
+reported at their normal severity.
+
 ## What none of the stages checks
 
 - **Business rules**, e.g. "a discount can't exceed 50%" or "only managers can approve".

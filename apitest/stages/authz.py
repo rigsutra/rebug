@@ -15,6 +15,7 @@ import httpx
 from ..discover import client_for
 from ..models import Finding, StageResult
 from ..auth import current_headers, has_user
+from ..explain import failure_body
 from ..proc import check, progress
 from ..testlog import log_of
 
@@ -59,14 +60,17 @@ def run(spec, cfg, out: Path) -> StageResult:
                         progress(cfg, "authz", f"Sending {label}; expecting 401/403", op=op.label, done=i, total=total)
                         r = _send(c, op, base, hdrs)
                         checked += 1
-                        served = 200 <= r.status_code < 300
+                        said_200 = failure_body(r.text) if 200 <= r.status_code < 300 else ""
+                        served = 200 <= r.status_code < 300 and not said_200
                         _log(cfg, f"Protected API called with {label}", r, op.label,
                              "Refused with 401 or 403", "fail" if served else "pass",
-                             {"credentials": label, "passive_issues": _passive_issues(r)},
+                             {"credentials": label, "passive_issues": _passive_issues(r), "error_200": said_200},
                              explanation=(f"Served the request (HTTP {r.status_code}) with {label}: anyone can call "
                                           "this API without logging in." if served else
+                                          f'Refused, but with HTTP {r.status_code} and an error body ("{said_200}") '
+                                          "instead of 401/403." if said_200 else
                                           f"Refused with HTTP {r.status_code}, as it should."))
-                        if 200 <= r.status_code < 300:
+                        if served:
                             res.findings.append(Finding(
                                 "authz", "critical",
                                 f"Secured endpoint accepted {label} (HTTP {r.status_code})",
@@ -154,11 +158,13 @@ def _bola(c, cfg, base, done_before: int = 0, total: int | None = None) -> list[
         op = f"{method} {path.split('?')[0]}"
         try:
             a = c.request(method, url, headers=current_headers(cfg, "a"), **body)
-            ok_a = 200 <= a.status_code < 300
+            said_a = failure_body(a.text) if 200 <= a.status_code < 300 else ""
+            ok_a = 200 <= a.status_code < 300 and not said_a
             _log(cfg, "Cross-user check, step 1: user A (the owner) reads its own data", a, op,
                  "2xx: the owner can access it", "pass" if ok_a else "error",
                  {"scenario_params": params, "user": "A"},
-                 explanation=f"User A got HTTP {a.status_code}." + ("" if ok_a else
+                 explanation=f"User A got HTTP {a.status_code}" + (f' with an error body ("{said_a}")' if said_a else "")
+                 + "." + ("" if ok_a else
                              " The owner can't read this resource, so the cross-user check couldn't run. "
                              "Check the IDs in the scenario and user A's token."))
             if not ok_a:
@@ -166,19 +172,21 @@ def _bola(c, cfg, base, done_before: int = 0, total: int | None = None) -> list[
                                    f"Owner (user A) got HTTP {a.status_code}; fix the scenario's IDs."))
                 continue
             b = c.request(method, url, headers=current_headers(cfg, "b"), **body)
-            leaked = 200 <= b.status_code < 300
+            said_b = failure_body(b.text) if 200 <= b.status_code < 300 else ""
+            leaked = 200 <= b.status_code < 300 and not said_b
             _log(cfg, "Cross-user check, step 2: user B tries to read user A's data", b, op,
                  "401, 403 or 404: user B must not see user A's data",
                  "fail" if leaked else "pass", {"scenario_params": params, "user": "B"},
                  explanation=(f"User B got user A's data (HTTP {b.status_code}). Any logged-in user can read other "
                               "users' data by changing the ID." if leaked else
-                              f"User B was refused (HTTP {b.status_code}), as it should."))
+                              f'User B was refused (HTTP {b.status_code}' + (f', with an error body: "{said_b}"'
+                                                                              if said_b else "") + "), as it should."))
         except httpx.HTTPError as e:
             out.append(Finding("authz", "info", "BOLA request failed", label, str(e)))
             if log_of(cfg):
                 log_of(cfg).add_error("authz", "BOLA request", method, url, str(e), op)
             continue
-        if 200 <= b.status_code < 300:
+        if leaked:
             out.append(Finding("authz", "critical", "BOLA: user B accessed user A's resource",
                                label, f"User B got HTTP {b.status_code}; expected 401/403/404."))
             progress(cfg, "authz", f"BOLA: user B got user A's data (HTTP {b.status_code})", op=op,

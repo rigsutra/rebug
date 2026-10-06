@@ -422,7 +422,7 @@ def test_test_log_for_refused_and_served_probes(fake, tmp_path):
     assert none["scenario"] == "Protected API called with no credentials"
     assert none["verdict"] == "fail" and none["response"]["status"] == 200
     assert none["explanation"].startswith("Served the request (HTTP 200) with no credentials")
-    assert none["details"] == {"credentials": "no credentials", "passive_issues": []}
+    assert none["details"] == {"credentials": "no credentials", "passive_issues": [], "error_200": ""}
     assert bad["scenario"] == "Protected API called with invalid credentials"
     assert bad["verdict"] == "pass" and bad["explanation"] == "Refused with HTTP 401, as it should."
     assert bad["request"]["headers"]["authorization"] == "Bearer ***"  # masked in the log

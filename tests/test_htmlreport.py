@@ -77,7 +77,9 @@ def test_findings_of_every_severity_grouped_per_api(tmp_path):
     assert [f["severity"] for f in fs] == SEVERITIES
     assert all(f["title"] == FINDING_TITLES[raw_title] and len(f["detail"]) == 1500 and f["stage"] == "conformance"
                for f in fs)
-    assert d["findings"][""] == [{"stage": "conformance", "severity": "high", "title": "Global thing", "detail": ""}]
+    assert d["findings"][""] == [{"stage": "conformance", "severity": "high", "title": "Global thing", "detail": "",
+                                  "fix": "See the failed test's explanation.", "spec_issue": False}]
+    assert "Validate input" in fs[0]["fix"] and fs[0]["spec_issue"] is False  # "Server error" -> crash fix
     assert d["run"]["stages"]["conformance"]["findings"] == len(findings)
 
 

@@ -23,6 +23,10 @@ class Config:
     fail_on: str = "high"
     out_dir: str = "reports"
     no_mutating_authz: bool = False
+    # The Swagger can't be trusted: findings that only show a mismatch with it become info ("Swagger problems")
+    lenient_spec: bool = False
+    # Working requests per API, used instead of the Swagger's examples: {"POST /x": {"body", "path", "query"}}
+    examples: dict[str, dict] = field(default_factory=dict)
     exclude_paths: list[str] = field(default_factory=list)
     bola: list[dict] = field(default_factory=list)
     timeout: float = 15.0

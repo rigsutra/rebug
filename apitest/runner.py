@@ -11,9 +11,9 @@ from .config import Config
 from .models import StageResult, sev_rank
 from .proc import Cancelled
 from .report import write_reports
-from .spec import METHODS, Spec, filter_operations, load_spec
+from .spec import METHODS, Spec, apply_examples, filter_operations, load_spec
 from .stages import authz, conformance, lint, types, zap
-from . import coverage, htmlreport
+from . import coverage, htmlreport, triage
 from .auth import current_headers, has_user, make_providers
 from .proc import progress
 from .testlog import TestLog, write_csv
@@ -57,6 +57,8 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
             raise ValueError("Exclude paths removed every operation; nothing to test")
         if len(keep) < len(spec.operations):
             spec = filter_operations(spec, keep)
+    if cfg.examples:
+        spec = apply_examples(spec, cfg.examples)
     base = cfg.base_url or spec.base_url
     emit({"type": "spec", "version": spec.version, "operations": len(spec.operations), "base_url": base,
           "labels": [o.label for o in spec.operations]})
@@ -88,7 +90,9 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
               "findings": len(res.findings), "note": res.note, "duration": res.duration})
 
     annotate(spec, base, results)
-    write_reports(out, cfg.spec, base, results)
+    if cfg.lenient_spec:
+        triage.apply_lenient(results)
+    write_reports(out, cfg.spec, base, results, lenient=cfg.lenient_spec)
     write_csv(out / "test-log.ndjson", out / "test-log.csv")
     settings = {"stages": cfg.stages, "headers": cfg.headers or ({"login": "auto"} if has_user(cfg, "a") else {}),
                 "headers_b": cfg.headers_b or ({"login": "auto"} if has_user(cfg, "b") else {}), "bola": cfg.bola,
@@ -98,7 +102,8 @@ def run_pipeline(cfg: Config, emit: Emit = lambda e: None) -> list[StageResult]:
     coverage.write(cov, out)
     htmlreport.build(out, {"project_name": cfg.title, "spec": cfg.spec, "status": "cancelled" if cancelled else "done",
                            "started": started, "finished": time.time(), "operations": cfg.operations,
-                           "headers": has_user(cfg, "a"), "headers_b": has_user(cfg, "b")}, cov)
+                           "headers": has_user(cfg, "a"), "headers_b": has_user(cfg, "b"),
+                           "lenient_spec": cfg.lenient_spec}, cov)
     emit({"type": "cancelled" if cancelled else "done", "report": str(out / "test-report.html")})
     return results
 

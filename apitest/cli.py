@@ -26,6 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--fail-on", choices=SEVERITIES, help="exit 1 if any finding is at/above this severity")
     r.add_argument("--out", help="output directory (default: reports)")
     r.add_argument("--no-mutating-authz", action="store_true", help="authz stage: only send GET/HEAD/OPTIONS")
+    r.add_argument("--lenient-spec", action="store_true",
+                   help="the Swagger isn't reliable: report mismatches with it as info (Swagger problems), "
+                        "keep crashes, auth, type and security findings")
     r.add_argument("--op", action="append", default=[], metavar='"METHOD /path"',
                    help="only test this operation (repeatable), e.g. --op \"GET /orders/{id}\"")
     d = sub.add_parser("discover", help="find the Swagger/OpenAPI documents of a running app and list its APIs")
@@ -108,6 +111,8 @@ def _run(args) -> int:
         cfg.out_dir = args.out
     if args.no_mutating_authz:
         cfg.no_mutating_authz = True
+    if args.lenient_spec:
+        cfg.lenient_spec = True
     if args.op:
         cfg.operations = args.op
     if not cfg.spec:
